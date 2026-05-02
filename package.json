@@ -1,6 +1,6 @@
 {
   "name": "prolly-tree-store",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Merkle Prolly Tree storage library for syncing large JSON documents efficiently",
   "type": "module",
   "main": "./dist/index.js",
@@ -16,6 +16,11 @@
     "README.md"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/thbrown/prolly-tree-store.git"
+  },
+  "homepage": "https://github.com/thbrown/prolly-tree-store",
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "prepublishOnly": "npm run build && npm run test:ci",

@@ -265,3 +265,7 @@ npx vitest run test/chaos.test.ts           # chaos / fuzz test (~5s)
 **Prolly boundaries** — Chunk splits are determined by `rollingHash(key) mod fanout`, where `fanout = chunkSize / AVG_ENTRY_SIZE`. Because boundaries depend only on keys (not values), updating a value never changes tree structure. Insert/delete may change structure near the modified key, but the `put` function always rebuilds from the correct canonical form.
 
 **Concurrency** — Chunk writes are safe to race (content-addressed, idempotent). Root pointer writes are last-writer-wins. For strong concurrency guarantees, the `StorageAdapter` should use conditional writes on root pointer keys.
+
+---
+
+Confidently written by [Claude Code](https://claude.ai/code).
