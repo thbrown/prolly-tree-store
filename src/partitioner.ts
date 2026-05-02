@@ -16,6 +16,22 @@ import { patch as treePatch } from './tree-patch.js';
 import { diff as treeDiff } from './tree-diff.js';
 import { calibrate, loadState } from './calibration.js';
 
+function withWriteRetries(adapter: StorageAdapter, retries: number): StorageAdapter {
+  const retry = async <T>(fn: () => Promise<T>): Promise<T> => {
+    let lastErr: unknown;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try { return await fn(); } catch (e) { lastErr = e; }
+    }
+    throw lastErr;
+  };
+  return {
+    persistBlob: (key, value) => retry(() => adapter.persistBlob(key, value)),
+    readBlob: adapter.readBlob.bind(adapter),
+    deleteBlob: (key) => retry(() => adapter.deleteBlob(key)),
+    ...(adapter.readBlobs ? { readBlobs: adapter.readBlobs.bind(adapter) } : {}),
+  };
+}
+
 export class ProllyTreeStore {
   private readonly adapter: StorageAdapter;
   private readonly calibrationTtlMs: number;
@@ -23,7 +39,8 @@ export class ProllyTreeStore {
   private _calibratePromise: Promise<PartitionerState> | null = null;
 
   constructor(options: PartitionerOptions) {
-    this.adapter = options.adapter;
+    const retries = options.writeRetries ?? 0;
+    this.adapter = retries > 0 ? withWriteRetries(options.adapter, retries) : options.adapter;
     this.calibrationTtlMs = options.calibrationTtlMs ?? DEFAULT_CALIBRATION_TTL_MS;
     this._state = options.initialState
       ? (options.initialState as PartitionerState)

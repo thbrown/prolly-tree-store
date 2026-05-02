@@ -51,6 +51,7 @@ export interface PartitionerOptions {
   adapter: StorageAdapter;
   initialState?: Partial<PartitionerState>;
   calibrationTtlMs?: number;
+  writeRetries?: number;
 }
 
 // ─── Internal node types ──────────────────────────────────────────────────────
