@@ -1,0 +1,36 @@
+{
+  "name": "prolly-tree-store",
+  "version": "1.0.0",
+  "description": "Merkle Prolly Tree storage library for syncing large JSON documents efficiently",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepublishOnly": "yarn build && yarn test:ci",
+    "test": "vitest --coverage run",
+    "test:ci": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@msgpack/msgpack": "^3.0.0",
+    "@noble/hashes": "^1.7.2",
+    "fast-json-patch": "^3.1.1"
+  },
+  "devDependencies": {
+    "@vitest/coverage-v8": "^4.1.4",
+    "typescript": "^5.0.0",
+    "vitest": "^4.1.4"
+  }
+}
