@@ -8,7 +8,7 @@ A Merkle Prolly Tree storage library for syncing large JSON documents efficientl
 - **O(changed nodes) diffs** — walks two trees in lockstep, pruning identical subtrees with a single hash comparison
 - **O(K · log n) patches** — applies K mutations directly to affected leaves without loading the full document
 - **Cross-chunk-size hash stability** — the same document always produces the same `entryHash` regardless of chunk size, so adapters with different configurations can be compared
-- **Structural sharing** — within a document, unchanged subtrees are never re-written across successive `put` calls
+- **Chunk deduplication on `put`** — unchanged chunks are not re-written to storage; only new or modified nodes are persisted
 - **RFC 6902 compliant patches and diffs** — `patch` accepts standard JSON Patch documents; `diff` produces them
 
 ## Installation
@@ -158,7 +158,7 @@ Measures adapter latency and derives optimal `chunkSize` / `prefetchWidth`, then
 
 **When calibration runs:** lazily, on the first call to `put` or `patch`. Before measuring, it checks whether the adapter already has a valid calibration result written by a previous instance within `calibrationTtlMs`. If so, that result is reused with no I/O probes. `get`, `getRootHash`, and `diff` never trigger calibration.
 
-**Effect of calibration on existing data:** a change in `chunkSize` does not corrupt or invalidate existing documents. `get`, `diff`, and `getRootHash` are chunk-size agnostic. `patch` always preserves the document's original chunk size. Only `put` rebuilds the tree using the current chunk size — if the size changed, the tree is restructured but the content hash stays the same. The main cost of an unstable calibration is that `put` can no longer reuse existing chunks. If your backend has consistent latency characteristics (most do), the default 7-day TTL is fine. If you want a fully stable chunk size, use `initialState`.
+**Effect of calibration on existing data:** a change in `chunkSize` does not corrupt or invalidate existing documents. `get`, `diff`, and `getRootHash` are chunk-size agnostic. `patch` always preserves the document's original chunk size. Only `put` uses the current chunk size — it always rebuilds the full tree in memory regardless, so a changed chunk size affects tree structure but not correctness. If you want a fully stable chunk size, use `initialState`.
 
 **To skip calibration entirely:** pass `initialState: { chunkSize: N }`. Recommended for tests and any environment where the chunk size is known up front.
 
