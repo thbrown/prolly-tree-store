@@ -17,6 +17,8 @@ A Merkle Prolly Tree storage library for syncing large JSON documents efficientl
 npm install prolly-tree-store
 ```
 
+Works in Node.js 18+ and all modern browsers. No Node-specific APIs are used — any environment that supports `performance.now()` and ESM imports is compatible.
+
 ## Quick start
 
 ```typescript
