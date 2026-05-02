@@ -10,6 +10,22 @@ export class BlobNotFoundError extends Error {
   }
 }
 
+/**
+ * Throw this from a StorageAdapter to signal that the failure is transient
+ * and the operation is safe to retry (e.g. network timeout, rate limit).
+ * Errors that are NOT RetryableStorageError are treated as fatal and will
+ * not be retried even when writeRetries > 0.
+ */
+export class RetryableStorageError extends Error {
+  readonly cause: unknown;
+
+  constructor(message: string, cause?: unknown) {
+    super(message);
+    this.name = 'RetryableStorageError';
+    this.cause = cause;
+  }
+}
+
 export class PatchTestFailedError extends Error {
   readonly pointer: JSONPointer;
   readonly expected: JSONValue;

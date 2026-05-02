@@ -8,7 +8,7 @@ A Merkle Prolly Tree storage library for syncing large JSON documents efficientl
 - **O(changed nodes) diffs** — walks two trees in lockstep, pruning identical subtrees with a single hash comparison
 - **O(K · log n) patches** — applies K mutations directly to affected leaves without loading the full document
 - **Cross-chunk-size hash stability** — the same document always produces the same `entryHash` regardless of chunk size, so adapters with different configurations can be compared
-- **Structural sharing** — unchanged subtrees are never re-written; two documents sharing a subtree store its nodes once
+- **Structural sharing** — within a document, unchanged subtrees are never re-written across successive `put` calls
 - **RFC 6902 compliant patches and diffs** — `patch` accepts standard JSON Patch documents; `diff` produces them
 
 ## Installation
@@ -158,6 +158,8 @@ Measures adapter latency and derives optimal `chunkSize` / `prefetchWidth`, then
 
 **When calibration runs:** lazily, on the first call to `put` or `patch`. Before measuring, it checks whether the adapter already has a valid calibration result written by a previous instance within `calibrationTtlMs`. If so, that result is reused with no I/O probes. `get`, `getRootHash`, and `diff` never trigger calibration.
 
+**Effect of calibration on existing data:** a change in `chunkSize` does not corrupt or invalidate existing documents. `get`, `diff`, and `getRootHash` are chunk-size agnostic. `patch` always preserves the document's original chunk size. Only `put` rebuilds the tree using the current chunk size — if the size changed, the tree is restructured but the content hash stays the same. The main cost of an unstable calibration is that `put` can no longer reuse existing chunks. If your backend has consistent latency characteristics (most do), the default 7-day TTL is fine. If you want a fully stable chunk size, use `initialState`.
+
 **To skip calibration entirely:** pass `initialState: { chunkSize: N }`. Recommended for tests and any environment where the chunk size is known up front.
 
 You can also call `calibrate()` manually to force a fresh measurement.
@@ -181,6 +183,55 @@ ProllyTreeStore.asKey('my-doc')     // validates non-empty, returns KeyString
 ProllyTreeStore.asPointer('/a/b')   // validates RFC 6901 format, returns JSONPointer
 ```
 
+## Errors
+
+The library exports three error classes:
+
+| Class | Thrown by | Meaning |
+|---|---|---|
+| `BlobNotFoundError` | `readBlob` (adapter contract) | A key that should exist is missing — indicates corrupted or missing storage |
+| `PatchTestFailedError` | `patch` | An RFC 6902 `test` op did not match the stored value; the document was not modified |
+| `RetryableStorageError` | adapter implementations | A transient failure that is safe to retry (see below) |
+
+### Retryable vs fatal errors
+
+When `writeRetries > 0`, the library retries failed `persistBlob` and `deleteBlob` calls — but **only** if the adapter throws `RetryableStorageError`. Any other error is treated as fatal and re-thrown immediately, regardless of remaining retry budget.
+
+This means your adapter is in control: throw `RetryableStorageError` for transient conditions (network timeout, rate limit, lock contention), and throw a plain `Error` (or any other class) for fatal ones (permission denied, quota exceeded, invalid key).
+
+```typescript
+import { RetryableStorageError, BlobNotFoundError } from 'prolly-tree-store';
+import type { StorageAdapter, KeyString, JSONBlob } from 'prolly-tree-store';
+
+class MyAdapter implements StorageAdapter {
+  async persistBlob(key: KeyString, value: JSONBlob): Promise<void> {
+    try {
+      await myBackend.write(key, value);
+    } catch (e) {
+      if (isNetworkTimeout(e) || isRateLimit(e)) {
+        throw new RetryableStorageError('transient write failure', e);
+      }
+      throw e; // fatal — do not retry
+    }
+  }
+
+  async readBlob(key: KeyString): Promise<JSONBlob> {
+    const value = await myBackend.read(key);
+    if (value === null) throw new BlobNotFoundError(key);
+    return value as JSONBlob;
+  }
+
+  async deleteBlob(key: KeyString): Promise<void> {
+    await myBackend.delete(key);
+  }
+}
+
+const store = new ProllyTreeStore({
+  adapter: new MyAdapter(),
+  writeRetries: 3,
+});
+```
+
 ## Implementing a StorageAdapter
 
 ```typescript
@@ -196,7 +247,7 @@ Blob values are opaque strings. Key patterns:
 - `__root__/{docKey}` — root pointer (small JSON, one per document)
 - `chunks/{xx}/{64-char-hex}` — tree node addressed by its BLAKE3 hash (base64-encoded msgpack)
 
-Because chunk keys are content-addressed, `persistBlob` is idempotent — writing the same chunk twice is safe. The library uses `readBlobs` (if provided) to batch-check which chunks already exist before writing, avoiding redundant writes. If your adapter has transient failure modes, use `writeRetries` to automatically retry failed `persistBlob` and `deleteBlob` calls.
+Because chunk keys are content-addressed, `persistBlob` is idempotent — writing the same chunk twice is safe. The library uses `readBlobs` (if provided) to batch-check which chunks already exist before writing, avoiding redundant writes. See the [Errors](#errors) section for how to signal retryable vs fatal failures.
 
 ## Running tests
 

@@ -9,7 +9,7 @@ import type {
   KeyString,
 } from './types.js';
 import { DEFAULT_CALIBRATION_TTL_MS } from './types.js';
-import { BlobNotFoundError } from './errors.js';
+import { BlobNotFoundError, RetryableStorageError } from './errors.js';
 import { get as treeGet, getRootHash as treeGetRootHash } from './tree-read.js';
 import { put as treePut, remove as treeRemove } from './tree-write.js';
 import { patch as treePatch } from './tree-patch.js';
@@ -20,7 +20,10 @@ function withWriteRetries(adapter: StorageAdapter, retries: number): StorageAdap
   const retry = async <T>(fn: () => Promise<T>): Promise<T> => {
     let lastErr: unknown;
     for (let attempt = 0; attempt <= retries; attempt++) {
-      try { return await fn(); } catch (e) { lastErr = e; }
+      try { return await fn(); } catch (e) {
+        if (!(e instanceof RetryableStorageError)) throw e;
+        lastErr = e;
+      }
     }
     throw lastErr;
   };
