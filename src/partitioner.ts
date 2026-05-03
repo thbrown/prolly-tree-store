@@ -38,6 +38,8 @@ function withWriteRetries(adapter: StorageAdapter, retries: number): StorageAdap
 export class ProllyTreeStore {
   private readonly adapter: StorageAdapter;
   private readonly calibrationTtlMs: number;
+  private readonly encoder: ((doc: JSONValue) => JSONValue) | undefined;
+  private readonly decoder: ((doc: JSONValue) => JSONValue) | undefined;
   private _state: Readonly<PartitionerState> | null;
   private _calibratePromise: Promise<PartitionerState> | null = null;
 
@@ -45,6 +47,8 @@ export class ProllyTreeStore {
     const retries = options.writeRetries ?? 0;
     this.adapter = retries > 0 ? withWriteRetries(options.adapter, retries) : options.adapter;
     this.calibrationTtlMs = options.calibrationTtlMs ?? DEFAULT_CALIBRATION_TTL_MS;
+    this.encoder = options.encoder;
+    this.decoder = options.decoder;
     this._state = options.initialState
       ? (options.initialState as PartitionerState)
       : null;
@@ -80,7 +84,8 @@ export class ProllyTreeStore {
   // ── Document reads ─────────────────────────────────────────────────────────
 
   async get(key: KeyString, pointer?: JSONPointer): Promise<JSONValue> {
-    return treeGet(key, this.adapter, pointer);
+    const result = await treeGet(key, this.adapter, pointer);
+    return this.decoder ? this.decoder(result) : result;
   }
 
   async getRootHash(key: KeyString): Promise<ContentHash> {
@@ -91,7 +96,7 @@ export class ProllyTreeStore {
 
   async put(key: KeyString, value: JSONValue): Promise<ContentHash> {
     const state = await this.ensureState();
-    return treePut(key, value, this.adapter, state);
+    return treePut(key, this.encoder ? this.encoder(value) : value, this.adapter, state);
   }
 
   async patch(key: KeyString, patches: JSONPatchDocument): Promise<ContentHash> {

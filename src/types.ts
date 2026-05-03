@@ -52,6 +52,18 @@ export interface PartitionerOptions {
   initialState?: Partial<PartitionerState>;
   calibrationTtlMs?: number;
   writeRetries?: number;
+  /**
+   * Optional document-level transform applied to the value before it is
+   * flattened and stored. `decoder` is the inverse, applied after the
+   * document is reconstructed from the tree on `get()`.
+   *
+   * When set, `diff()` and `patch()` operate on the *encoded* stored form, so
+   * patches produced by `diff()` reference encoded paths (e.g. `/$abc/_name`).
+   * Manual RFC 6902 patches passed to `patch()` must also use encoded paths.
+   * Pointers passed to `get(key, pointer)` must reference the encoded form.
+   */
+  encoder?: (doc: JSONValue) => JSONValue;
+  decoder?: (doc: JSONValue) => JSONValue;
 }
 
 // ─── Internal node types ──────────────────────────────────────────────────────
