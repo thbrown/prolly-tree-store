@@ -29,32 +29,34 @@ export interface EntryReader {
 /**
  * Whether child `i` of an internal node can contain keys under `prefix`.
  *
- * Child `i` covers the key range `[lo, hi)`, where `lo` is its separator key
- * (`''` for the first child) and `hi` is the next child's separator (`null` for
- * the last). The keys under `prefix` occupy `[prefix, prefixUpperBound(prefix))`,
- * so the two ranges overlap exactly when the test below holds.
+ * Child `i` covers `(previousLast, last]`: every key above the previous child's
+ * last key, up to and including its own. The keys under `prefix` occupy
+ * `[prefix, prefixUpperBound(prefix))`, so the ranges overlap when the child's
+ * last key reaches the prefix and the previous child's does not already cover
+ * past it.
  *
  * The empty prefix is the whole document rather than a bounded range, so it
  * matches every child.
  */
-function childOverlapsPrefix(lo: string, hi: string | null, prefix: string): boolean {
+function childOverlapsPrefix(
+  previousLast: string | null,
+  last: string,
+  prefix: string
+): boolean {
   if (prefix === '') return true;
-  return lo < prefixUpperBound(prefix) && (hi === null || hi > prefix);
+  return last >= prefix && (previousLast === null || previousLast < prefixUpperBound(prefix));
 }
 
-function childRange(node: InternalNode, i: number): [string, string | null] {
-  return [
-    i === 0 ? '' : node.keys[i - 1],
-    i < node.keys.length ? node.keys[i] : null,
-  ];
+function childRange(node: InternalNode, i: number): [string | null, string] {
+  return [i === 0 ? null : node.keys[i - 1], node.keys[i]];
 }
 
 /** Index of the single child whose range contains `key`. */
 function childIndexForKey(node: InternalNode, key: string): number {
-  for (let i = node.keys.length - 1; i >= 0; i--) {
-    if (key >= node.keys[i]) return i + 1;
+  for (let i = 0; i < node.keys.length; i++) {
+    if (key <= node.keys[i]) return i;
   }
-  return 0;
+  return node.keys.length - 1;
 }
 
 /** Every entry at or beneath `prefix`, in no particular order. */
@@ -74,8 +76,8 @@ export async function scanPrefix(
   const internal = node as InternalNode;
   const relevant: Uint8Array[] = [];
   for (let i = 0; i < internal.children.length; i++) {
-    const [lo, hi] = childRange(internal, i);
-    if (childOverlapsPrefix(lo, hi, prefix)) relevant.push(internal.children[i]);
+    const [previousLast, last] = childRange(internal, i);
+    if (childOverlapsPrefix(previousLast, last, prefix)) relevant.push(internal.children[i]);
   }
 
   const childResults = await Promise.all(
@@ -129,8 +131,8 @@ export async function existsPrefix(
 
   const internal = node as InternalNode;
   for (let i = 0; i < internal.children.length; i++) {
-    const [lo, hi] = childRange(internal, i);
-    if (!childOverlapsPrefix(lo, hi, prefix)) continue;
+    const [previousLast, last] = childRange(internal, i);
+    if (!childOverlapsPrefix(previousLast, last, prefix)) continue;
     if (await existsPrefix(internal.children[i], prefix, docKey, adapter, strict, cache)) return true;
   }
   return false;

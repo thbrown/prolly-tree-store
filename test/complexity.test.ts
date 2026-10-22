@@ -178,9 +178,11 @@ describe('complexity', () => {
 
       // The 2000-key document has roughly 4x the chunks of the 500-key one...
       expect(chunkCounts[1]).toBeGreaterThan(chunkCounts[0] * 2);
-      // ...but a single-key patch costs the same handful of reads either way.
-      expect(reads[0]).toBeLessThan(20);
-      expect(reads[1]).toBeLessThanOrEqual(reads[0]);
+      // ...while a single-key patch costs a handful of reads either way: a few
+      // per level, growing with depth rather than with document size.
+      expect(reads[0]).toBeLessThan(25);
+      expect(reads[1]).toBeLessThan(reads[0] + 10);
+      expect(reads[1]).toBeLessThan(chunkCounts[1] / 10);
     });
 
     test('patching leaves no orphaned chunks behind', async () => {

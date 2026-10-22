@@ -11,7 +11,8 @@ import { toPatch } from './types.js';
 import { decodeRootPointer, decodeValue } from './serialization.js';
 import { unflattenEntries, treeKeyToPointer, isUnderPrefix, relativeKey } from './encoding.js';
 import * as jsonpatch from 'fast-json-patch';
-import { rootKey, fetchNode } from './tree-utils.js';
+import { rootKey, fetchNode, newNodeCache } from './tree-utils.js';
+import type { NodeCache } from './tree-utils.js';
 import { existsPrefix, kindOf } from './prefix-scan.js';
 import { readSubtree } from './tree-read.js';
 
@@ -26,16 +27,17 @@ function arraysEqual(a: Uint8Array, b: Uint8Array): boolean {
 async function collectAllLeafEntries(
   chunkHashBytes: Uint8Array,
   docKey: KeyString,
-  adapter: StorageAdapter
+  adapter: StorageAdapter,
+  cache: NodeCache
 ): Promise<Map<string, Uint8Array>> {
-  const node = await fetchNode(chunkHashBytes, docKey, adapter);
+  const node = await fetchNode(chunkHashBytes, docKey, adapter, cache);
   if (node.type === 0x02) {
     const leaf = node as LeafNode;
     return new Map(leaf.entries.map(e => [e.key, e.valueMsgpack]));
   }
   const internal = node as InternalNode;
   const childMaps = await Promise.all(
-    internal.children.map(ch => collectAllLeafEntries(ch, docKey, adapter))
+    internal.children.map(ch => collectAllLeafEntries(ch, docKey, adapter, cache))
   );
   const result = new Map<string, Uint8Array>();
   for (const m of childMaps) for (const [k, v] of m) result.set(k, v);
@@ -43,6 +45,16 @@ async function collectAllLeafEntries(
 }
 
 // ─── Entry-level change collection ───────────────────────────────────────────
+
+/**
+ * One decoded-node cache per document, reused across every walk a single diff
+ * performs. Without it the ancestor probes below re-read the path from the root
+ * for each changed key, which costs more than reading the whole document.
+ */
+interface DiffCaches {
+  a: NodeCache;
+  b: NodeCache;
+}
 
 interface EntryChanges {
   added: Map<string, StoredValue>;
@@ -60,13 +72,14 @@ async function walkChanges(
   keyA: KeyString,
   keyB: KeyString,
   adapter: StorageAdapter,
-  result: EntryChanges
+  result: EntryChanges,
+  caches: DiffCaches
 ): Promise<void> {
   if (arraysEqual(hashA, hashB)) return;
 
   const [nodeA, nodeB] = await Promise.all([
-    fetchNode(hashA, keyA, adapter),
-    fetchNode(hashB, keyB, adapter),
+    fetchNode(hashA, keyA, adapter, caches.a),
+    fetchNode(hashB, keyB, adapter, caches.b),
   ]);
 
   if (nodeA.type === 0x02 && nodeB.type === 0x02) {
@@ -75,14 +88,14 @@ async function walkChanges(
   }
 
   if (nodeA.type === 0x01 && nodeB.type === 0x01) {
-    await diffInternalNodes(nodeA as InternalNode, nodeB as InternalNode, keyA, keyB, adapter, result);
+    await diffInternalNodes(nodeA as InternalNode, nodeB as InternalNode, keyA, keyB, adapter, result, caches);
     return;
   }
 
   // Mixed levels — collect everything from both sides
   const [entriesA, entriesB] = await Promise.all([
-    collectAllLeafEntries(hashA, keyA, adapter),
-    collectAllLeafEntries(hashB, keyB, adapter),
+    collectAllLeafEntries(hashA, keyA, adapter, caches.a),
+    collectAllLeafEntries(hashB, keyB, adapter, caches.b),
   ]);
   mergeEntryMaps(entriesA, entriesB, result);
 }
@@ -135,7 +148,8 @@ async function diffInternalNodes(
   keyA: KeyString,
   keyB: KeyString,
   adapter: StorageAdapter,
-  result: EntryChanges
+  result: EntryChanges,
+  caches: DiffCaches
 ): Promise<void> {
   const sameStructure =
     nodeA.keys.length === nodeB.keys.length &&
@@ -145,14 +159,14 @@ async function diffInternalNodes(
     const tasks: Promise<void>[] = [];
     for (let i = 0; i < nodeA.children.length; i++) {
       if (!arraysEqual(nodeA.children[i], nodeB.children[i])) {
-        tasks.push(walkChanges(nodeA.children[i], nodeB.children[i], keyA, keyB, adapter, result));
+        tasks.push(walkChanges(nodeA.children[i], nodeB.children[i], keyA, keyB, adapter, result, caches));
       }
     }
     await Promise.all(tasks);
   } else {
     const [entriesA, entriesB] = await Promise.all([
-      collectAllLeafEntries(nodeA.chunkHash, keyA, adapter),
-      collectAllLeafEntries(nodeB.chunkHash, keyB, adapter),
+      collectAllLeafEntries(nodeA.chunkHash, keyA, adapter, caches.a),
+      collectAllLeafEntries(nodeB.chunkHash, keyB, adapter, caches.b),
     ]);
     mergeEntryMaps(entriesA, entriesB, result);
   }
@@ -173,7 +187,8 @@ async function findKindChangeRoots(
   rootBHash: Uint8Array,
   keyA: KeyString,
   keyB: KeyString,
-  adapter: StorageAdapter
+  adapter: StorageAdapter,
+  caches: DiffCaches
 ): Promise<string[]> {
   const changedKeys = new Set<string>([
     ...changes.added.keys(),
@@ -194,8 +209,8 @@ async function findKindChangeRoots(
       let differs = settled.get(path);
       if (differs === undefined) {
         const [kindA, kindB] = await Promise.all([
-          kindOf(rootAHash, path, keyA, adapter),
-          kindOf(rootBHash, path, keyB, adapter),
+          kindOf(rootAHash, path, keyA, adapter, caches.a),
+          kindOf(rootBHash, path, keyB, adapter, caches.b),
         ]);
         // An absent side means a plain add or remove; stop descending.
         if (kindA === 'absent' || kindB === 'absent') break;
@@ -221,7 +236,8 @@ async function changesToOps(
   rootBHash: Uint8Array,
   keyA: KeyString,
   keyB: KeyString,
-  adapter: StorageAdapter
+  adapter: StorageAdapter,
+  caches: DiffCaches
 ): Promise<jsonpatch.Operation[]> {
   const ops: jsonpatch.Operation[] = [];
 
@@ -231,10 +247,10 @@ async function changesToOps(
   // cannot be reconciled entry by entry: the entry-level adds and removes would
   // mix with array index shifting and leave debris behind. Replace the whole
   // value at the shallowest such path and suppress everything beneath it.
-  const shapeRoots = await findKindChangeRoots(changes, rootAHash, rootBHash, keyA, keyB, adapter);
+  const shapeRoots = await findKindChangeRoots(changes, rootAHash, rootBHash, keyA, keyB, adapter, caches);
 
   for (const key of shapeRoots) {
-    const value = await readSubtree(rootBHash, key, keyB, adapter);
+    const value = await readSubtree(rootBHash, key, keyB, adapter, caches.b);
     ops.push({
       op: 'replace',
       path: treeKeyToPointer(key) as string,
@@ -255,7 +271,7 @@ async function changesToOps(
 
     for (let depth = 1; depth < segments.length; depth++) {
       const prefix = segments.slice(0, depth).join('\x00');
-      if (!(await existsPrefix(rootBHash, prefix, keyB, adapter))) {
+      if (!(await existsPrefix(rootBHash, prefix, keyB, adapter, false, caches.b))) {
         removeAt = prefix;
         break;
       }
@@ -282,7 +298,7 @@ async function changesToOps(
 
     for (let depth = 1; depth < segments.length; depth++) {
       const prefix = segments.slice(0, depth).join('\x00');
-      if (!(await existsPrefix(rootAHash, prefix, keyA, adapter))) {
+      if (!(await existsPrefix(rootAHash, prefix, keyA, adapter, false, caches.a))) {
         addAt = prefix;
         break;
       }
@@ -355,18 +371,20 @@ export async function diff(
 
   if (arraysEqual(rootA.entryHash, rootB.entryHash)) return toPatch('[]');
 
+  const caches: DiffCaches = { a: newNodeCache(), b: newNodeCache() };
+
   const changes: EntryChanges = {
     added: new Map(),
     removed: new Set(),
     modified: new Map(),
   };
 
-  await walkChanges(rootA.chunkHash, rootB.chunkHash, keyA, keyB, adapter, changes);
+  await walkChanges(rootA.chunkHash, rootB.chunkHash, keyA, keyB, adapter, changes, caches);
 
   if (changes.added.size === 0 && changes.removed.size === 0 && changes.modified.size === 0) {
     return toPatch('[]');
   }
 
-  const ops = await changesToOps(changes, rootA.chunkHash, rootB.chunkHash, keyA, keyB, adapter);
+  const ops = await changesToOps(changes, rootA.chunkHash, rootB.chunkHash, keyA, keyB, adapter, caches);
   return toPatch(JSON.stringify(ops));
 }

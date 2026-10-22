@@ -121,8 +121,23 @@ export interface InternalNode {
   chunkHash: Uint8Array;
   entryHash: Uint8Array;
   level: number;
-  keys: string[];     // separator keys (first key of each child except the first)
-  children: Uint8Array[]; // chunkHash of each child
+  /**
+   * Last key covered by each child, one per child. A child holds every key up to
+   * and including its entry here, which routes lookups; it is also the key the
+   * child's chunk closed on, which the level above groups by.
+   */
+  keys: string[];
+  /** chunkHash of each child. */
+  children: Uint8Array[];
+  /**
+   * entryHash of each child, one per child.
+   *
+   * Carrying these lets `patch` split a node, or drop an emptied one, using only
+   * the node in hand: a new node's entryHash is the XOR of its children's, so no
+   * sibling has to be fetched to recompute it. Without them, re-chunking during
+   * a patch would cost a read per sibling.
+   */
+  childEntryHashes: Uint8Array[];
 }
 
 export interface RootPointer {
@@ -141,9 +156,11 @@ export type TreeNode = LeafNode | InternalNode;
  * On-disk format version, written into every root pointer.
  *
  * v2 made container shape explicit (see ARRAY_MARKER), fixed array indices to be
- * dense, and stopped double-escaping pointer segments. v1 trees are not readable.
+ * dense, and stopped double-escaping pointer segments. v3 added per-child entry
+ * hashes and first keys to internal nodes so `patch` can re-chunk incrementally.
+ * Earlier trees are not readable.
  */
-export const FORMAT_VERSION = 2;
+export const FORMAT_VERSION = 3;
 
 export const ROOT_PREFIX = '__root__/';
 export const CHUNK_PREFIX = 'chunks/';

@@ -67,6 +67,7 @@ export function encodeNode(node: LeafNode | InternalNode): Uint8Array {
       l: node.level,
       k: node.keys,
       c: node.children,
+      e: node.childEntryHashes,
     });
   }
 }
@@ -98,6 +99,7 @@ export function decodeNode(bytes: Uint8Array, chunkHash: Uint8Array): TreeNode {
       level: raw.l as number,
       keys: raw.k as string[],
       children: raw.c as Uint8Array[],
+      childEntryHashes: raw.e as Uint8Array[],
     } satisfies InternalNode;
   }
 }
