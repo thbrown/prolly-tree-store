@@ -154,6 +154,57 @@ describe('complexity', () => {
       expect(patchWrites).toBeLessThan(30);
     });
 
+    test('read count does not grow with document size', async () => {
+      // Regression: orphan collection used to walk the whole new tree after each
+      // patch, so a one-key patch read every node in the document (278 reads on
+      // a 274-chunk tree). Reads must stay proportional to tree depth.
+      const reads: number[] = [];
+      const chunkCounts: number[] = [];
+
+      for (const n of [500, 2000]) {
+        const adapter = new MemoryStorageAdapter();
+        await put(k('doc'), makeDoc(n), adapter, { chunkSize: CHUNK_SIZE });
+        chunkCounts.push(adapter.keys().filter(key => key.startsWith('chunks/')).length);
+
+        const readSpy = vi.spyOn(adapter, 'readBlob');
+        const batchSpy = vi.spyOn(adapter, 'readBlobs');
+
+        await patch(k('doc'), p([{ op: 'replace', path: '/key_000005', value: 'updated' }]), adapter);
+        reads.push(countReads(readSpy, batchSpy));
+
+        readSpy.mockRestore();
+        batchSpy.mockRestore();
+      }
+
+      // The 2000-key document has roughly 4x the chunks of the 500-key one...
+      expect(chunkCounts[1]).toBeGreaterThan(chunkCounts[0] * 2);
+      // ...but a single-key patch costs the same handful of reads either way.
+      expect(reads[0]).toBeLessThan(20);
+      expect(reads[1]).toBeLessThanOrEqual(reads[0]);
+    });
+
+    test('patching leaves no orphaned chunks behind', async () => {
+      const adapter = new MemoryStorageAdapter();
+      await put(k('doc'), makeDoc(300), adapter, { chunkSize: CHUNK_SIZE });
+
+      for (let i = 0; i < 20; i++) {
+        await patch(
+          k('doc'),
+          p([{ op: 'replace', path: `/key_${String(i * 7).padStart(6, '0')}`, value: `v${i}` }]),
+          adapter,
+        );
+      }
+
+      // Every chunk blob must still be reachable from the root: re-putting the
+      // document the patches produced may not shrink the store.
+      const stored = adapter.keys().filter(key => key.startsWith('chunks/doc/')).length;
+      const readBack = await get(k('doc'), adapter);
+      await put(k('doc'), readBack, adapter, { chunkSize: CHUNK_SIZE });
+      const reachable = adapter.keys().filter(key => key.startsWith('chunks/doc/')).length;
+
+      expect(stored).toBe(reachable);
+    });
+
     test('write count scales with m (affected entries) but collapses shared ancestors', async () => {
       const adapter = new MemoryStorageAdapter();
       await put(k('doc'), makeDoc(500), adapter, { chunkSize: CHUNK_SIZE });

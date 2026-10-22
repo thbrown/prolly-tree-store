@@ -11,7 +11,7 @@ import type {
 import { DEFAULT_CALIBRATION_TTL_MS } from './types.js';
 import { BlobNotFoundError, RetryableStorageError } from './errors.js';
 import { get as treeGet, getRootHash as treeGetRootHash } from './tree-read.js';
-import { put as treePut, remove as treeRemove } from './tree-write.js';
+import { put as treePut, remove as treeRemove, gc as treeGc } from './tree-write.js';
 import { patch as treePatch } from './tree-patch.js';
 import { diff as treeDiff } from './tree-diff.js';
 import { calibrate, loadState } from './calibration.js';
@@ -38,6 +38,7 @@ function withWriteRetries(adapter: StorageAdapter, retries: number): StorageAdap
 export class ProllyTreeStore {
   private readonly adapter: StorageAdapter;
   private readonly calibrationTtlMs: number;
+  private readonly retainStaleChunks: boolean;
   private readonly encoder: ((doc: JSONValue) => JSONValue) | undefined;
   private readonly decoder: ((doc: JSONValue) => JSONValue) | undefined;
   private _state: Readonly<PartitionerState> | null;
@@ -47,6 +48,7 @@ export class ProllyTreeStore {
     const retries = options.writeRetries ?? 0;
     this.adapter = retries > 0 ? withWriteRetries(options.adapter, retries) : options.adapter;
     this.calibrationTtlMs = options.calibrationTtlMs ?? DEFAULT_CALIBRATION_TTL_MS;
+    this.retainStaleChunks = options.retainStaleChunks ?? false;
     this.encoder = options.encoder;
     this.decoder = options.decoder;
     this._state = options.initialState
@@ -96,7 +98,13 @@ export class ProllyTreeStore {
 
   async put(key: KeyString, value: JSONValue): Promise<ContentHash> {
     const state = await this.ensureState();
-    return treePut(key, this.encoder ? this.encoder(value) : value, this.adapter, state);
+    return treePut(
+      key,
+      this.encoder ? this.encoder(value) : value,
+      this.adapter,
+      state,
+      this.retainStaleChunks
+    );
   }
 
   async patch(key: KeyString, patches: JSONPatchDocument): Promise<ContentHash> {
@@ -108,6 +116,35 @@ export class ProllyTreeStore {
 
   async diff(keyA: KeyString, keyB: KeyString): Promise<JSONPatchDocument> {
     return treeDiff(keyA, keyB, this.adapter);
+  }
+
+  // ── Maintenance ────────────────────────────────────────────────────────────
+
+  /**
+   * Rebuild the document at `key` in canonical form and return its root hash.
+   *
+   * `patch` routes mutations straight to the affected leaves and does not
+   * re-chunk, so a document edited only by patches drifts away from the chunk
+   * layout `put` would produce: leaves grow past `chunkSize` as entries are
+   * added. Reads and hashes stay correct — `entryHash` is independent of chunk
+   * layout — but oversized leaves cost more to fetch and rewrite. Compacting
+   * restores the canonical layout; it reads and rewrites the whole document.
+   */
+  async compact(key: KeyString): Promise<ContentHash> {
+    const state = await this.ensureState();
+    const value = await treeGet(key, this.adapter);
+    return treePut(key, value, this.adapter, state, this.retainStaleChunks);
+  }
+
+  /**
+   * Delete chunk blobs under `key` that the current tree no longer references,
+   * returning how many were removed.
+   *
+   * Reclaims chunks left behind by an interrupted write, and by `put` when
+   * `retainStaleChunks` is set. Requires `listBlobs` on the adapter.
+   */
+  async gc(key: KeyString): Promise<number> {
+    return treeGc(key, this.adapter);
   }
 
   // ── Deletion ───────────────────────────────────────────────────────────────

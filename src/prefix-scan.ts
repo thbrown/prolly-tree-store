@@ -8,6 +8,7 @@ import type {
 import { prefixUpperBound, isUnderPrefix } from './encoding.js';
 import { isArrayMarkerBytes } from './serialization.js';
 import { fetchNode } from './tree-utils.js';
+import type { NodeCache } from './tree-utils.js';
 
 /**
  * Read access to a document's leaf entries by key or key prefix.
@@ -61,9 +62,10 @@ export async function scanPrefix(
   rootHash: Uint8Array,
   prefix: string,
   docKey: KeyString,
-  adapter: StorageAdapter
+  adapter: StorageAdapter,
+  cache?: NodeCache
 ): Promise<LeafEntry[]> {
-  const node = await fetchNode(rootHash, docKey, adapter);
+  const node = await fetchNode(rootHash, docKey, adapter, cache);
 
   if (node.type === 0x02) {
     return (node as LeafNode).entries.filter(e => isUnderPrefix(e.key, prefix));
@@ -77,7 +79,7 @@ export async function scanPrefix(
   }
 
   const childResults = await Promise.all(
-    relevant.map(child => scanPrefix(child, prefix, docKey, adapter))
+    relevant.map(child => scanPrefix(child, prefix, docKey, adapter, cache))
   );
   return childResults.flat();
 }
@@ -87,12 +89,13 @@ export async function getEntry(
   rootHash: Uint8Array,
   key: string,
   docKey: KeyString,
-  adapter: StorageAdapter
+  adapter: StorageAdapter,
+  cache?: NodeCache
 ): Promise<LeafEntry | null> {
   let hash = rootHash;
 
   for (;;) {
-    const node = await fetchNode(hash, docKey, adapter);
+    const node = await fetchNode(hash, docKey, adapter, cache);
     if (node.type === 0x02) {
       return (node as LeafNode).entries.find(e => e.key === key) ?? null;
     }
@@ -113,9 +116,10 @@ export async function existsPrefix(
   prefix: string,
   docKey: KeyString,
   adapter: StorageAdapter,
-  strict = false
+  strict = false,
+  cache?: NodeCache
 ): Promise<boolean> {
-  const node = await fetchNode(rootHash, docKey, adapter);
+  const node = await fetchNode(rootHash, docKey, adapter, cache);
 
   if (node.type === 0x02) {
     return (node as LeafNode).entries.some(
@@ -127,7 +131,7 @@ export async function existsPrefix(
   for (let i = 0; i < internal.children.length; i++) {
     const [lo, hi] = childRange(internal, i);
     if (!childOverlapsPrefix(lo, hi, prefix)) continue;
-    if (await existsPrefix(internal.children[i], prefix, docKey, adapter, strict)) return true;
+    if (await existsPrefix(internal.children[i], prefix, docKey, adapter, strict, cache)) return true;
   }
   return false;
 }
@@ -147,11 +151,12 @@ export async function kindOf(
   rootHash: Uint8Array,
   key: string,
   docKey: KeyString,
-  adapter: StorageAdapter
+  adapter: StorageAdapter,
+  cache?: NodeCache
 ): Promise<ValueKind> {
   const [entry, hasDescendants] = await Promise.all([
-    getEntry(rootHash, key, docKey, adapter),
-    existsPrefix(rootHash, key, docKey, adapter, true),
+    getEntry(rootHash, key, docKey, adapter, cache),
+    existsPrefix(rootHash, key, docKey, adapter, true, cache),
   ]);
 
   if (entry === null) return hasDescendants ? 'object' : 'absent';
@@ -163,11 +168,12 @@ export async function kindOf(
 export function treeReader(
   rootHash: Uint8Array,
   docKey: KeyString,
-  adapter: StorageAdapter
+  adapter: StorageAdapter,
+  cache?: NodeCache
 ): EntryReader {
   return {
-    getEntry: key => getEntry(rootHash, key, docKey, adapter),
-    scanPrefix: prefix => scanPrefix(rootHash, prefix, docKey, adapter),
-    existsPrefix: prefix => existsPrefix(rootHash, prefix, docKey, adapter),
+    getEntry: key => getEntry(rootHash, key, docKey, adapter, cache),
+    scanPrefix: prefix => scanPrefix(rootHash, prefix, docKey, adapter, cache),
+    existsPrefix: prefix => existsPrefix(rootHash, prefix, docKey, adapter, false, cache),
   };
 }

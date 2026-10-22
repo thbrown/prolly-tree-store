@@ -12,7 +12,7 @@ import { flattenDocument } from './encoding.js';
 import { buildTree } from './prolly.js';
 import { encodeRootPointer, nodeBytesToBlob, decodeRootPointer, decodeNode, blobToNodeBytes } from './serialization.js';
 import { entryHashToContentHash, toHex, hexToBytes } from './hashing.js';
-import { rootKey, chunkKey } from './tree-utils.js';
+import { rootKey, chunkKey, chunkPrefix } from './tree-utils.js';
 
 /**
  * Walk the tree rooted at `nodeHash` and collect every chunk hex hash into `out`.
@@ -50,18 +50,23 @@ export async function put(
   key: KeyString,
   value: JSONValue,
   adapter: StorageAdapter,
-  state?: Partial<PartitionerState>
+  state?: Partial<PartitionerState>,
+  retainStaleChunks = false
 ): Promise<ContentHash> {
   const chunkSize = state?.chunkSize ?? DEFAULT_CHUNK_SIZE;
 
-  // Collect old chunk hashes before overwriting (for cleanup after commit)
+  // Collect old chunk hashes before overwriting (for cleanup after commit).
+  // Skipped entirely when stale chunks are retained — walking the old tree is
+  // O(n) reads, and there is nothing to do with the result.
   const oldChunkHexes = new Set<string>();
-  try {
-    const oldRootBlob = await adapter.readBlob(rootKey(key));
-    const oldRootPtr = decodeRootPointer(oldRootBlob);
-    await collectAllChunkHexes(oldRootPtr.chunkHash, key, adapter, oldChunkHexes);
-  } catch {
-    // No existing document — nothing to clean up
+  if (!retainStaleChunks) {
+    try {
+      const oldRootBlob = await adapter.readBlob(rootKey(key));
+      const oldRootPtr = decodeRootPointer(oldRootBlob);
+      await collectAllChunkHexes(oldRootPtr.chunkHash, key, adapter, oldChunkHexes);
+    } catch {
+      // No existing document — nothing to clean up
+    }
   }
 
   // Flatten the document into sorted (treeKey → StoredValue) entries
@@ -107,6 +112,47 @@ export async function put(
   );
 
   return entryHashToContentHash(root.entryHash);
+}
+
+/**
+ * Reclaim chunk blobs under `key` that the current tree no longer references.
+ *
+ * Needed because a crash between writing chunks and committing the root pointer
+ * leaves the written chunks behind, and because `retainStaleChunks` defers
+ * reclamation on purpose. Requires `listBlobs` on the adapter: orphans are by
+ * definition unreachable from the root, so there is no other way to find them.
+ *
+ * Returns the number of blobs deleted.
+ */
+export async function gc(key: KeyString, adapter: StorageAdapter): Promise<number> {
+  if (!adapter.listBlobs) {
+    throw new Error(
+      'gc() requires the storage adapter to implement listBlobs(prefix)'
+    );
+  }
+
+  const prefix = chunkPrefix(key);
+  const stored = await adapter.listBlobs(prefix);
+
+  let rootPtr: RootPointer;
+  try {
+    rootPtr = decodeRootPointer(await adapter.readBlob(rootKey(key)));
+  } catch {
+    // No document: every chunk under the prefix is unreachable.
+    await Promise.all(stored.map(blobKey => adapter.deleteBlob(blobKey)));
+    return stored.length;
+  }
+
+  const reachable = new Set<string>();
+  await collectAllChunkHexes(rootPtr.chunkHash, key, adapter, reachable);
+
+  const reachableKeys = new Set(
+    [...reachable].map(hex => chunkKey(key, hexToBytes(hex)) as string)
+  );
+  const orphans = stored.filter(blobKey => !reachableKeys.has(blobKey as string));
+
+  await Promise.all(orphans.map(blobKey => adapter.deleteBlob(blobKey)));
+  return orphans.length;
 }
 
 /**

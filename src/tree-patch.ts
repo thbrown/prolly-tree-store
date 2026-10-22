@@ -10,15 +10,14 @@ import type {
 } from './types.js';
 import {
   decodeRootPointer,
-  decodeNode,
   encodeNode,
-  blobToNodeBytes,
   nodeBytesToBlob,
   encodeRootPointer,
 } from './serialization.js';
 import { chunkHashOf, entryHashOf, entryHashToContentHash, toHex, hexToBytes } from './hashing.js';
 import * as jsonpatch from 'fast-json-patch';
-import { rootKey, chunkKey, fetchNode } from './tree-utils.js';
+import { rootKey, chunkKey, fetchNode, newNodeCache } from './tree-utils.js';
+import type { NodeCache } from './tree-utils.js';
 import { treeReader } from './prefix-scan.js';
 import { PendingState, applyOps } from './patch-overlay.js';
 import type { KeyMutation } from './patch-overlay.js';
@@ -53,26 +52,53 @@ interface MutationResult {
   oldEntryHash: Uint8Array;
 }
 
+/** True if every byte of a 32-byte hash is zero. */
+function isZeroHash(hash: Uint8Array): boolean {
+  for (let i = 0; i < hash.length; i++) if (hash[i] !== 0) return false;
+  return true;
+}
+
+/**
+ * Nodes written and nodes made unreachable by a mutation walk.
+ *
+ * `retained` holds the children of visited internal nodes that the walk did not
+ * descend into. Those subtrees are unchanged and still referenced, and their
+ * hashes are known from the parent node that was already fetched — so deciding
+ * what is safe to delete costs no extra reads.
+ */
+interface WalkOutcome {
+  newNodes: Map<string, Uint8Array>;
+  replacedHexes: Set<string>;
+  retainedHexes: Set<string>;
+}
+
 /**
  * Apply `mutations` to the subtree rooted at `nodeHash`.
  *
- * New nodes are collected in `newNodes`. Replaced node hashes are collected
- * in `replacedHexes` so the caller can delete the now-orphaned blobs after
+ * New nodes are collected in `out.newNodes`. Replaced node hashes go to
+ * `out.replacedHexes` so the caller can delete the orphaned blobs after
  * committing the new root pointer.
+ *
+ * A node is only a deletion candidate if its hash cannot appear elsewhere in the
+ * tree. Within one document every node covers a distinct key range, and a node's
+ * encoded bytes include its keys, so two nodes cannot share a hash — with one
+ * exception: nodes that cover no entries at all (an emptied leaf, or an internal
+ * node over emptied leaves) have no keys to tell them apart. Those are
+ * identified by an all-zero entryHash and are never deleted; they are a handful
+ * of bytes each, and the next `put` reclaims them.
  */
 async function applyMutationBatch(
   nodeHash: Uint8Array,
   mutations: KeyMutation[],
   docKey: KeyString,
   adapter: StorageAdapter,
-  newNodes: Map<string, Uint8Array>,
-  replacedHexes: Set<string>
+  out: WalkOutcome,
+  cache: NodeCache
 ): Promise<MutationResult> {
-  const node = await fetchNode(nodeHash, docKey, adapter);
+  const node = await fetchNode(nodeHash, docKey, adapter, cache);
   const oldEntryHash = new Uint8Array(node.entryHash);
 
-  // Track that this node is being replaced
-  replacedHexes.add(toHex(nodeHash));
+  if (!isZeroHash(oldEntryHash)) out.replacedHexes.add(toHex(nodeHash));
 
   // ── Leaf ──────────────────────────────────────────────────────────────────
   if (node.type === 0x02) {
@@ -99,7 +125,7 @@ async function applyMutationBatch(
     const chunkHashHex = chunkHashOf(bytes) as string;
     const chunkHash = hexToBytes(chunkHashHex);
 
-    newNodes.set(chunkHashHex, bytes);
+    out.newNodes.set(chunkHashHex, bytes);
     return { chunkHash, entryHash, oldEntryHash };
   }
 
@@ -107,10 +133,15 @@ async function applyMutationBatch(
   const internal = node as InternalNode;
   const childMutMap = distributeToChildren(internal, mutations);
 
+  // Siblings the walk will not descend into keep their subtrees intact.
+  for (let i = 0; i < internal.children.length; i++) {
+    if (!childMutMap.has(i)) out.retainedHexes.add(toHex(internal.children[i]));
+  }
+
   const childResults = await Promise.all(
     [...childMutMap.entries()].map(async ([childIdx, childMuts]) => {
       const result = await applyMutationBatch(
-        internal.children[childIdx], childMuts, docKey, adapter, newNodes, replacedHexes
+        internal.children[childIdx], childMuts, docKey, adapter, out, cache
       );
       return { childIdx, result };
     })
@@ -138,49 +169,8 @@ async function applyMutationBatch(
   const chunkHashHex = chunkHashOf(bytes) as string;
   newInternal.chunkHash = hexToBytes(chunkHashHex);
 
-  newNodes.set(chunkHashHex, bytes);
+  out.newNodes.set(chunkHashHex, bytes);
   return { chunkHash: newInternal.chunkHash, entryHash: newEntryHash, oldEntryHash };
-}
-
-// ─── New-tree reachability walk ───────────────────────────────────────────────
-
-/**
- * Walk the new tree (root at `nodeHash`) and collect every reachable chunk hex.
- * Uses `newNodes` for newly-created nodes (in memory) and the adapter for
- * unchanged nodes, avoiding double-reads where possible.
- *
- * This is needed because `replacedHexes` may contain a hash that was visited
- * during mutation traversal but also appears as an UNCHANGED child elsewhere in
- * the new tree (e.g. two children with identical content sharing the same hash).
- * Simply checking `newNodes` misses those retained references.
- */
-async function collectNewTreeHexes(
-  nodeHash: Uint8Array,
-  docKey: KeyString,
-  adapter: StorageAdapter,
-  newNodes: Map<string, Uint8Array>,
-  out: Set<string>
-): Promise<void> {
-  const hex = toHex(nodeHash);
-  if (out.has(hex)) return;
-  out.add(hex);
-
-  let bytes: Uint8Array;
-  if (newNodes.has(hex)) {
-    bytes = newNodes.get(hex)!;
-  } else {
-    const blob = await adapter.readBlob(chunkKey(docKey, nodeHash));
-    bytes = blobToNodeBytes(blob);
-  }
-
-  const node = decodeNode(bytes, nodeHash);
-  if (node.type === 0x01) {
-    await Promise.all(
-      (node as InternalNode).children.map(ch =>
-        collectNewTreeHexes(ch, docKey, adapter, newNodes, out)
-      )
-    );
-  }
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────
@@ -209,21 +199,23 @@ export async function patch(
 
   if (ops.length === 0) return entryHashToContentHash(rootPtr.entryHash);
 
-  const state = new PendingState(treeReader(rootPtr.chunkHash, key, adapter));
+  const cache = newNodeCache();
+  const state = new PendingState(treeReader(rootPtr.chunkHash, key, adapter, cache));
   await applyOps(ops, state);
 
   const mutations: KeyMutation[] = state.toMutations();
   if (mutations.length === 0) return entryHashToContentHash(rootPtr.entryHash);
 
-  const newNodes = new Map<string, Uint8Array>();
-  const replacedHexes = new Set<string>();
-  const result = await applyMutationBatch(
-    rootPtr.chunkHash, mutations, key, adapter, newNodes, replacedHexes
-  );
+  const out: WalkOutcome = {
+    newNodes: new Map(),
+    replacedHexes: new Set(),
+    retainedHexes: new Set(),
+  };
+  const result = await applyMutationBatch(rootPtr.chunkHash, mutations, key, adapter, out, cache);
 
   // Write new nodes
   await Promise.all(
-    [...newNodes.entries()].map(([hex, bytes]) =>
+    [...out.newNodes.entries()].map(([hex, bytes]) =>
       adapter.persistBlob(chunkKey(key, hexToBytes(hex)), nodeBytesToBlob(bytes))
     )
   );
@@ -237,16 +229,12 @@ export async function patch(
     calibratedAt: rootPtr.calibratedAt,
   }));
 
-  // Collect ALL hashes reachable from the new root before deleting anything.
-  // This prevents deleting a hash that appears multiple times in the old tree
-  // (e.g. two children with identical content): the visited copy is in
-  // replacedHexes, but the untouched copy is still referenced by the new tree.
-  const allNewTreeHexes = new Set<string>();
-  await collectNewTreeHexes(result.chunkHash, key, adapter, newNodes, allNewTreeHexes);
-
+  // Delete the nodes the walk replaced, except any that the new tree still
+  // points at: a node rewritten to identical bytes, or a retained sibling.
+  // Both sets came from nodes already in hand, so this needs no further reads.
   await Promise.all(
-    [...replacedHexes]
-      .filter(hex => !allNewTreeHexes.has(hex))
+    [...out.replacedHexes]
+      .filter(hex => !out.newNodes.has(hex) && !out.retainedHexes.has(hex))
       .map(hex => adapter.deleteBlob(chunkKey(key, hexToBytes(hex))))
   );
 

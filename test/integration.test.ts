@@ -9,7 +9,7 @@ const K = (s: string) => ProllyTreeStore.asKey(s);
 function makeP(chunkSize = 4096) {
   return new ProllyTreeStore({
     adapter: new MemoryStorageAdapter(),
-    initialState: { chunkSize, prefetchWidth: 2 },
+    initialState: { chunkSize },
   });
 }
 
@@ -36,7 +36,7 @@ describe('Integration: put → get roundtrip', () => {
 describe('Integration: diff/patch symmetry', () => {
   test('patch(A, diff(A,B)) === B for simple change', async () => {
     const adapter = new MemoryStorageAdapter();
-    const opts = { adapter, initialState: { chunkSize: 4096, prefetchWidth: 2 } };
+    const opts = { adapter, initialState: { chunkSize: 4096 } };
     const p = new ProllyTreeStore(opts);
 
     const docA = { name: 'Alice', score: 10, active: true };
@@ -53,7 +53,7 @@ describe('Integration: diff/patch symmetry', () => {
 
   test('patch(A, diff(A,B)) === B for large documents', async () => {
     const adapter = new MemoryStorageAdapter();
-    const p = new ProllyTreeStore({ adapter, initialState: { chunkSize: 256, prefetchWidth: 2 } });
+    const p = new ProllyTreeStore({ adapter, initialState: { chunkSize: 256 } });
 
     const docA: Record<string, number> = {};
     const docB: Record<string, number> = {};

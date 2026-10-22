@@ -14,6 +14,8 @@ import { entryHashToContentHash } from './hashing.js';
 import { unflattenEntries, relativeKey } from './encoding.js';
 import { resolvePointer } from './pointer.js';
 import { treeReader, scanPrefix } from './prefix-scan.js';
+import { newNodeCache } from './tree-utils.js';
+import type { NodeCache } from './tree-utils.js';
 import { rootKey } from './tree-utils.js';
 
 async function fetchRootPointer(
@@ -44,9 +46,10 @@ export async function readSubtree(
   rootHash: Uint8Array,
   treeKey: string,
   docKey: KeyString,
-  adapter: StorageAdapter
+  adapter: StorageAdapter,
+  cache?: NodeCache
 ): Promise<JSONValue | undefined> {
-  const entries = await scanPrefix(rootHash, treeKey, docKey, adapter);
+  const entries = await scanPrefix(rootHash, treeKey, docKey, adapter, cache);
   if (entries.length === 0) return undefined;
 
   return unflattenEntries(
@@ -76,10 +79,13 @@ export async function get(
     return value === undefined ? {} : value;
   }
 
-  const reader = treeReader(rootPtr.chunkHash, key, adapter);
+  // Resolving the pointer and reading the target share every node above the
+  // leaf, so one cache serves both walks.
+  const cache = newNodeCache();
+  const reader = treeReader(rootPtr.chunkHash, key, adapter, cache);
   const resolved = await resolvePointer(pointer, reader);
 
-  const value = await readSubtree(rootPtr.chunkHash, resolved.treeKey, key, adapter);
+  const value = await readSubtree(rootPtr.chunkHash, resolved.treeKey, key, adapter, cache);
   if (value === undefined) {
     throw new BlobNotFoundError(toKey(`${key as string}${pointer as string}`));
   }

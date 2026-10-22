@@ -17,7 +17,7 @@ describe('ProllyTreeStore', () => {
 
   test('state is set when initialState provided', () => {
     const p = makePartitioner({
-      initialState: { chunkSize: 4096, prefetchWidth: 2 },
+      initialState: { chunkSize: 4096 },
     });
     expect(p.state).not.toBeNull();
     expect((p.state as any).chunkSize).toBe(4096);
@@ -62,7 +62,7 @@ describe('ProllyTreeStore', () => {
   });
 
   test('full CRUD cycle', async () => {
-    const p = makePartitioner({ initialState: { chunkSize: 4096, prefetchWidth: 2 } });
+    const p = makePartitioner({ initialState: { chunkSize: 4096 } });
     const key = ProllyTreeStore.asKey('doc');
 
     await p.put(key, { name: 'Alice', score: 10 });

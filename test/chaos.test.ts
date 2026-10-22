@@ -191,7 +191,7 @@ describe('Chaos: random operation sequences', () => {
     const adapter = new MemoryStorageAdapter();
     const store = new ProllyTreeStore({
       adapter,
-      initialState: { chunkSize: 512, prefetchWidth: 2 } as never,
+      initialState: { chunkSize: 512 } as never,
     });
 
     const docKeys = ['chaos-a', 'chaos-b', 'chaos-c'].map(ProllyTreeStore.asKey);
@@ -330,8 +330,11 @@ describe('Chaos: random operation sequences', () => {
     expect(counters.patch).toBeGreaterThan(0);
     expect(counters.diff).toBeGreaterThan(0);
 
-    // Deleting every document must leave no blobs behind except calibration.
+    // Deleting a document removes everything reachable from its root. Patches
+    // can orphan a node that covers no entries (see applyMutationBatch), so gc
+    // is what guarantees the store comes back to empty.
     for (const key of docKeys) await store.delete(key);
+    for (const key of docKeys) await store.gc(key);
     expect(adapter.keys().filter(k => !k.startsWith('__calibration__'))).toEqual([]);
   }, CHAOS_DURATION_MS + 60_000);
 });

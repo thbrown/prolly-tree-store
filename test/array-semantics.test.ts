@@ -20,7 +20,7 @@ function makeStore(chunkSize = 4096) {
   const adapter = new MemoryStorageAdapter();
   const store = new ProllyTreeStore({
     adapter,
-    initialState: { chunkSize, prefetchWidth: 2 } as never,
+    initialState: { chunkSize } as never,
   });
   return { adapter, store };
 }

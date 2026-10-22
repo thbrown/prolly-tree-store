@@ -9,11 +9,28 @@ describe('calibrate', () => {
 
     expect(state.chunkSize).toBeGreaterThanOrEqual(4096);
     expect(state.chunkSize).toBeLessThanOrEqual(524288);
-    expect(state.prefetchWidth).toBeGreaterThanOrEqual(2);
-    expect(state.prefetchWidth).toBeLessThanOrEqual(32);
-    expect(state.cacheSizeBytes).toBeGreaterThan(0);
+    expect(state.overheadLatency).toBeGreaterThanOrEqual(0);
+    expect(state.perKbLatency).toBeGreaterThanOrEqual(0);
     expect(['indexeddb', 'gcp', 'unknown']).toContain(state.detectedBackend);
     expect(state.calibratedAt).toMatch(/^\d{4}-\d{2}-\d{2}/); // ISO date
+  });
+
+  test('probe keys are unique per run so concurrent clients do not collide', async () => {
+    const adapter = new MemoryStorageAdapter();
+    const seen = new Set<string>();
+    const originalPersist = adapter.persistBlob.bind(adapter);
+    adapter.persistBlob = async (key, value) => {
+      if ((key as string).startsWith('__calibration__/probe_')) seen.add(key as string);
+      return originalPersist(key, value);
+    };
+
+    await calibrate(adapter);
+    const firstRun = [...seen];
+    seen.clear();
+    await calibrate(adapter);
+
+    expect(firstRun).not.toHaveLength(0);
+    expect([...seen].some(k => firstRun.includes(k))).toBe(false);
   });
 
   test('probe blobs are deleted after calibration', async () => {

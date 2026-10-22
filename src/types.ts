@@ -49,17 +49,25 @@ export interface StorageAdapter {
   persistBlob(key: KeyString, value: JSONBlob): Promise<void>;
   readBlob(key: KeyString): Promise<JSONBlob>;
   deleteBlob(key: KeyString): Promise<void>;
+  /** Optional batch read, used to skip writing chunks that already exist. */
   readBlobs?(keys: KeyString[]): Promise<Map<KeyString, JSONBlob>>;
+  /**
+   * Optional prefix listing. Required by `gc()`, which has no other way to find
+   * blobs that are no longer referenced. Both IndexedDB (key ranges) and GCS
+   * (prefix queries) support this.
+   */
+  listBlobs?(prefix: string): Promise<KeyString[]>;
 }
 
 // ─── Calibration ─────────────────────────────────────────────────────────────
 
 export interface PartitionerState {
+  /** Measured fixed cost of one read, in milliseconds. */
   overheadLatency: number;
+  /** Measured marginal cost of reading one further KB, in milliseconds. */
   perKbLatency: number;
+  /** Target size of a tree node blob, in bytes — the only tuned parameter. */
   chunkSize: number;
-  prefetchWidth: number;
-  cacheSizeBytes: number;
   calibratedAt: string;
   detectedBackend: 'indexeddb' | 'gcp' | 'unknown';
 }
@@ -71,6 +79,15 @@ export interface PartitionerOptions {
   initialState?: Partial<PartitionerState>;
   calibrationTtlMs?: number;
   writeRetries?: number;
+  /**
+   * Keep chunks that a `put` replaced instead of deleting them immediately.
+   *
+   * Deleting straight away can break a reader that is midway through the old
+   * version of the tree — another tab, or a peer that read the root pointer a
+   * moment ago. Retaining them trades storage for that safety; `gc(key)`
+   * reclaims them once readers have moved on. Defaults to false.
+   */
+  retainStaleChunks?: boolean;
   /**
    * Optional document-level transform applied to the value before it is
    * flattened and stored. `decoder` is the inverse, applied after the
