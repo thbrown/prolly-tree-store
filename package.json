@@ -26,6 +26,7 @@
     "prepublishOnly": "npm run build && npm run test:ci",
     "test": "vitest --coverage run",
     "test:ci": "vitest run",
+    "diagrams": "node tools/diagrams/build.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
