@@ -39,3 +39,45 @@ export class PatchTestFailedError extends Error {
     this.actual = actual;
   }
 }
+
+/**
+ * Thrown by `patch` for an RFC 6902 operation this library cannot apply —
+ * an unrecognised `op`, or an array index outside the valid range.
+ * The document is left unchanged.
+ */
+export class UnsupportedPatchOperationError extends Error {
+  readonly op: string;
+
+  constructor(op: string, detail: string) {
+    super(`Unsupported patch operation "${op}": ${detail}`);
+    this.name = 'UnsupportedPatchOperationError';
+    this.op = op;
+  }
+}
+
+/**
+ * Thrown when a document cannot be represented in the flat keyspace — currently
+ * only object keys containing a NUL byte, which is the tree key separator.
+ */
+export class InvalidDocumentError extends Error {
+  readonly pointer: string;
+
+  constructor(pointer: string, detail: string) {
+    super(`Invalid document at ${pointer || '/'}: ${detail}`);
+    this.name = 'InvalidDocumentError';
+    this.pointer = pointer;
+  }
+}
+
+/** Thrown when a stored root pointer was written by an incompatible version. */
+export class UnsupportedFormatError extends Error {
+  readonly found: unknown;
+  readonly expected: number;
+
+  constructor(found: unknown, expected: number) {
+    super(`Unsupported on-disk format ${String(found)} (this build reads format ${expected})`);
+    this.name = 'UnsupportedFormatError';
+    this.found = found;
+    this.expected = expected;
+  }
+}

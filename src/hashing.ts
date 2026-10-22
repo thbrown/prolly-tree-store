@@ -69,9 +69,3 @@ export function combineEntryHashes(hashes: Uint8Array[]): Uint8Array {
 export function entryHashToContentHash(bytes: Uint8Array): ContentHash {
   return toHash(toHex(bytes));
 }
-
-/** Derive the chunk blob storage key from a 64-char hex chunkHash. */
-export function chunkBlobKey(chunkHash: ContentHash): string {
-  const hex = chunkHash as string;
-  return `chunks/${hex.slice(0, 2)}/${hex}`;
-}

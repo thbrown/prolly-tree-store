@@ -7,7 +7,7 @@ import type {
   RootPointer,
   InternalNode,
 } from './types.js';
-import { DEFAULT_CHUNK_SIZE } from './types.js';
+import { DEFAULT_CHUNK_SIZE, FORMAT_VERSION } from './types.js';
 import { flattenDocument } from './encoding.js';
 import { buildTree } from './prolly.js';
 import { encodeRootPointer, nodeBytesToBlob, decodeRootPointer, decodeNode, blobToNodeBytes } from './serialization.js';
@@ -64,9 +64,9 @@ export async function put(
     // No existing document — nothing to clean up
   }
 
-  // Flatten the document into sorted (treeKey → JSONValue) entries
+  // Flatten the document into sorted (treeKey → StoredValue) entries
   const flatMap = flattenDocument(value);
-  const entries = [...flatMap.entries()].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0) as [string, JSONValue][];
+  const entries = [...flatMap.entries()].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
 
   // Build the Prolly tree
   const { root, rootBytes, allNodes } = buildTree(entries, chunkSize);
@@ -90,6 +90,7 @@ export async function put(
 
   // Write the root pointer
   const rootPointer: RootPointer = {
+    format: FORMAT_VERSION,
     chunkHash: root.chunkHash,
     entryHash: root.entryHash,
     chunkSize,

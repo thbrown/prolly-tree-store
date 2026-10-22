@@ -8,7 +8,6 @@ import type {
   LeafNode,
   InternalNode,
 } from './types.js';
-import { PatchTestFailedError } from './errors.js';
 import {
   decodeRootPointer,
   decodeNode,
@@ -16,22 +15,13 @@ import {
   blobToNodeBytes,
   nodeBytesToBlob,
   encodeRootPointer,
-  encodeValue,
 } from './serialization.js';
 import { chunkHashOf, entryHashOf, entryHashToContentHash, toHex, hexToBytes } from './hashing.js';
-import { pointerToTreeKey, flattenDocument } from './encoding.js';
-import { toPointer } from './types.js';
-import { get } from './tree-read.js';
 import * as jsonpatch from 'fast-json-patch';
 import { rootKey, chunkKey, fetchNode } from './tree-utils.js';
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-// ─── Key-level mutation types ─────────────────────────────────────────────────
-
-type KeyMutation =
-  | { key: string; op: 'set'; valueMsgpack: Uint8Array }
-  | { key: string; op: 'del' };
+import { treeReader } from './prefix-scan.js';
+import { PendingState, applyOps } from './patch-overlay.js';
+import type { KeyMutation } from './patch-overlay.js';
 
 // ─── Routing mutations to children ────────────────────────────────────────────
 
@@ -53,76 +43,6 @@ function distributeToChildren(
     map.get(idx)!.push(m);
   }
   return map;
-}
-
-// ─── Partial entry collection ─────────────────────────────────────────────────
-
-async function collectEntriesUnderPrefix(
-  nodeHash: Uint8Array,
-  prefix: string,
-  docKey: KeyString,
-  adapter: StorageAdapter
-): Promise<Array<{ key: string; valueMsgpack: Uint8Array }>> {
-  const node = await fetchNode(nodeHash, docKey, adapter);
-
-  if (node.type === 0x02) {
-    const leaf = node as LeafNode;
-    return leaf.entries.filter(
-      e => prefix === '' || e.key === prefix || e.key.startsWith(prefix + '\x00')
-    );
-  }
-
-  const internal = node as InternalNode;
-  const results: Array<{ key: string; valueMsgpack: Uint8Array }> = [];
-
-  for (let i = 0; i < internal.children.length; i++) {
-    const lo = i === 0 ? '' : internal.keys[i - 1];
-    const hi = i < internal.keys.length ? internal.keys[i] : null;
-    const loOk = lo === '' || lo <= prefix || lo.startsWith(prefix) || prefix.startsWith(lo) || prefix >= lo;
-    const hiOk = hi === null || hi > prefix;
-    if (loOk && hiOk) {
-      const sub = await collectEntriesUnderPrefix(internal.children[i], prefix, docKey, adapter);
-      results.push(...sub);
-    }
-  }
-
-  return results;
-}
-
-// ─── Ops → flat key mutations ─────────────────────────────────────────────────
-
-async function opsToMutations(
-  ops: jsonpatch.Operation[],
-  rootHash: Uint8Array,
-  docKey: KeyString,
-  adapter: StorageAdapter
-): Promise<KeyMutation[]> {
-  const byKey = new Map<string, KeyMutation>();
-  const apply = (m: KeyMutation) => byKey.set(m.key, m);
-
-  for (const op of ops) {
-    if (op.op === 'test') continue;
-
-    const prefix = pointerToTreeKey(op.path as JSONPointer);
-
-    if (op.op === 'remove' || op.op === 'replace' || op.op === 'add') {
-      const old = await collectEntriesUnderPrefix(rootHash, prefix, docKey, adapter);
-      for (const e of old) apply({ key: e.key, op: 'del' });
-    }
-
-    if (op.op === 'add' || op.op === 'replace') {
-      const flat = flattenDocument((op as jsonpatch.AddOperation<JSONValue> | jsonpatch.ReplaceOperation<JSONValue>).value);
-      for (const [suffix, value] of flat) {
-        const key =
-          prefix === '' ? suffix
-          : suffix === '' ? prefix
-          : `${prefix}\x00${suffix}`;
-        apply({ key, op: 'set', valueMsgpack: encodeValue(value) });
-      }
-    }
-  }
-
-  return [...byKey.values()].sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
 }
 
 // ─── Core incremental tree update ────────────────────────────────────────────
@@ -268,8 +188,11 @@ async function collectNewTreeHexes(
 /**
  * Apply an RFC 6902 patch to a stored document without loading the full document.
  *
- * `test` ops are evaluated via partial reads before any mutation. If any test
- * fails the document is left unchanged and PatchTestFailedError is thrown.
+ * Operations are planned in order against an overlay of pending entry changes
+ * (see ./patch-overlay.ts), so each op sees the result of the ones before it, as
+ * RFC 6902 requires. Nothing is written until the whole list has been planned:
+ * if any op is rejected — a failing `test`, an out-of-range array index, an
+ * unsupported op — the stored document is left untouched.
  *
  * Replaced nodes are deleted after the new root pointer is committed, keeping
  * storage bounded with no separate GC sweep required.
@@ -280,26 +203,16 @@ export async function patch(
   adapter: StorageAdapter,
 ): Promise<ContentHash> {
   const ops: jsonpatch.Operation[] = JSON.parse(patches as string);
-  if (ops.length === 0) {
-    const blob = await adapter.readBlob(rootKey(key));
-    const rootPtr = decodeRootPointer(blob);
-    return entryHashToContentHash(rootPtr.entryHash);
-  }
-
-  // Validate all test ops atomically via partial reads — no full-doc load
-  for (const op of ops) {
-    if (op.op !== 'test') continue;
-    const actual = await get(key, adapter, op.path as JSONPointer);
-    const expected = (op as jsonpatch.TestOperation<JSONValue>).value;
-    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
-      throw new PatchTestFailedError(toPointer(op.path), expected as JSONValue, actual);
-    }
-  }
 
   const rootBlob = await adapter.readBlob(rootKey(key));
   const rootPtr = decodeRootPointer(rootBlob);
 
-  const mutations = await opsToMutations(ops, rootPtr.chunkHash, key, adapter);
+  if (ops.length === 0) return entryHashToContentHash(rootPtr.entryHash);
+
+  const state = new PendingState(treeReader(rootPtr.chunkHash, key, adapter));
+  await applyOps(ops, state);
+
+  const mutations: KeyMutation[] = state.toMutations();
   if (mutations.length === 0) return entryHashToContentHash(rootPtr.entryHash);
 
   const newNodes = new Map<string, Uint8Array>();
@@ -317,6 +230,7 @@ export async function patch(
 
   // Commit new root pointer
   await adapter.persistBlob(rootKey(key), encodeRootPointer({
+    format: rootPtr.format,
     chunkHash: result.chunkHash,
     entryHash: result.entryHash,
     chunkSize: rootPtr.chunkSize,

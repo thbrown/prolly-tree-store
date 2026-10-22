@@ -16,6 +16,25 @@ export type JSONPatchDocument = Brand<string, 'JSONPatchDocument'>;
 export type JSONPointer = Brand<string, 'JSONPointer'>;
 export type ContentHash = Brand<string, 'ContentHash'>;
 
+// ─── Array marker ─────────────────────────────────────────────────────────────
+
+declare const arrayMarkerBrand: unique symbol;
+export interface ArrayMarker {
+  readonly [arrayMarkerBrand]: true;
+}
+
+/**
+ * Sentinel stored at an array's own tree key to record that the container is an
+ * array rather than an object. Serialised as a msgpack extension type, which no
+ * JSON value can produce, so it is unambiguous — and because it lives inside
+ * `valueMsgpack` it contributes to `entryHash`, making container shape part of
+ * the content identity.
+ */
+export const ARRAY_MARKER = Object.freeze({}) as unknown as ArrayMarker;
+
+/** A value as stored in a leaf entry: any JSON value, or the array marker. */
+export type StoredValue = JSONValue | ArrayMarker;
+
 // ─── Internal cast helpers (no validation) ───────────────────────────────────
 
 export const toKey = (s: string): KeyString => s as KeyString;
@@ -90,6 +109,7 @@ export interface InternalNode {
 }
 
 export interface RootPointer {
+  format: number; // on-disk format version — see FORMAT_VERSION
   chunkHash: Uint8Array; // chunkHash of the root node blob
   entryHash: Uint8Array; // chunk-size-independent fingerprint
   chunkSize: number;
@@ -99,6 +119,14 @@ export interface RootPointer {
 export type TreeNode = LeafNode | InternalNode;
 
 // ─── Constants ────────────────────────────────────────────────────────────────
+
+/**
+ * On-disk format version, written into every root pointer.
+ *
+ * v2 made container shape explicit (see ARRAY_MARKER), fixed array indices to be
+ * dense, and stopped double-escaping pointer segments. v1 trees are not readable.
+ */
+export const FORMAT_VERSION = 2;
 
 export const ROOT_PREFIX = '__root__/';
 export const CHUNK_PREFIX = 'chunks/';

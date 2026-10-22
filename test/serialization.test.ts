@@ -10,6 +10,7 @@ import {
   blobToNodeBytes,
 } from '../src/serialization.js';
 import type { LeafNode, InternalNode, RootPointer } from '../src/types.js';
+import { FORMAT_VERSION } from '../src/types.js';
 
 describe('encodeValue / decodeValue', () => {
   const cases: [string, unknown][] = [
@@ -86,6 +87,7 @@ describe('encodeNode / decodeNode — InternalNode', () => {
 describe('encodeRootPointer / decodeRootPointer', () => {
   test('roundtrip', () => {
     const root: RootPointer = {
+      format: FORMAT_VERSION,
       chunkHash: new Uint8Array(32).fill(0xab),
       entryHash: new Uint8Array(32).fill(0xcd),
       chunkSize: 4096,

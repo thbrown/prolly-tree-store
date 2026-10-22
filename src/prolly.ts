@@ -1,4 +1,4 @@
-import type { LeafNode, InternalNode, TreeNode, JSONValue } from './types.js';
+import type { LeafNode, InternalNode, TreeNode, StoredValue } from './types.js';
 import { AVG_ENTRY_SIZE } from './types.js';
 import { encodeValue, encodeNode } from './serialization.js';
 import { chunkHashOf, entryHashOf, combineEntryHashes, toHex, hexToBytes } from './hashing.js';
@@ -65,7 +65,7 @@ export interface BuiltTree {
  * Guarantees at least one leaf even if no boundaries are found.
  */
 export function buildLeafNodes(
-  entries: [string, JSONValue][],
+  entries: [string, StoredValue][],
   chunkSize: number
 ): BuiltLeaf[] {
   if (entries.length === 0) {
@@ -75,7 +75,7 @@ export function buildLeafNodes(
   }
 
   const leaves: BuiltLeaf[] = [];
-  let current: [string, JSONValue][] = [];
+  let current: [string, StoredValue][] = [];
 
   for (const entry of entries) {
     current.push(entry);
@@ -92,7 +92,7 @@ export function buildLeafNodes(
   return leaves;
 }
 
-function makeLeaf(entries: [string, JSONValue][]): BuiltLeaf {
+function makeLeaf(entries: [string, StoredValue][]): BuiltLeaf {
   const leafEntries = entries.map(([key, value]) => ({
     key,
     valueMsgpack: encodeValue(value),
@@ -190,7 +190,7 @@ function makeInternal(
  * Returns the root node, its bytes, and a map of all chunkHash → bytes.
  */
 export function buildTree(
-  entries: [string, JSONValue][],
+  entries: [string, StoredValue][],
   chunkSize: number
 ): BuiltTree {
   const allNodes = new Map<string, Uint8Array>();

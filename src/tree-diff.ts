@@ -2,18 +2,18 @@ import type {
   StorageAdapter,
   KeyString,
   JSONValue,
+  StoredValue,
   JSONPatchDocument,
   LeafNode,
   InternalNode,
 } from './types.js';
 import { toPatch } from './types.js';
-import {
-  decodeRootPointer,
-  decodeValue,
-} from './serialization.js';
-import { unflattenEntries, treeKeyToPointer } from './encoding.js';
+import { decodeRootPointer, decodeValue } from './serialization.js';
+import { unflattenEntries, treeKeyToPointer, isUnderPrefix, relativeKey } from './encoding.js';
 import * as jsonpatch from 'fast-json-patch';
 import { rootKey, fetchNode } from './tree-utils.js';
+import { existsPrefix, kindOf } from './prefix-scan.js';
+import { readSubtree } from './tree-read.js';
 
 function arraysEqual(a: Uint8Array, b: Uint8Array): boolean {
   if (a.length !== b.length) return false;
@@ -42,40 +42,12 @@ async function collectAllLeafEntries(
   return result;
 }
 
-async function hasKeyWithPrefix(
-  prefix: string,
-  chunkHashBytes: Uint8Array,
-  docKey: KeyString,
-  adapter: StorageAdapter
-): Promise<boolean> {
-  const node = await fetchNode(chunkHashBytes, docKey, adapter);
-
-  if (node.type === 0x02) {
-    const leaf = node as LeafNode;
-    return leaf.entries.some(
-      e => e.key === prefix || e.key.startsWith(prefix + '\x00')
-    );
-  }
-
-  const internal = node as InternalNode;
-  for (let i = 0; i < internal.children.length; i++) {
-    const lo = i === 0 ? '' : internal.keys[i - 1];
-    const hi = i < internal.keys.length ? internal.keys[i] : null;
-    const loOk = lo === '' || lo <= prefix || lo.startsWith(prefix) || prefix.startsWith(lo + '\x00') || prefix >= lo;
-    const hiOk = hi === null || hi > prefix || hi.startsWith(prefix);
-    if (loOk && hiOk) {
-      if (await hasKeyWithPrefix(prefix, internal.children[i], docKey, adapter)) return true;
-    }
-  }
-  return false;
-}
-
 // ─── Entry-level change collection ───────────────────────────────────────────
 
 interface EntryChanges {
-  added: Map<string, JSONValue>;
+  added: Map<string, StoredValue>;
   removed: Set<string>;
-  modified: Map<string, JSONValue>;
+  modified: Map<string, StoredValue>;
 }
 
 /**
@@ -186,6 +158,61 @@ async function diffInternalNodes(
   }
 }
 
+// ─── Kind-change detection ────────────────────────────────────────────────────
+
+/**
+ * The shallowest paths at which the two documents disagree about the kind of
+ * value stored, considering every changed key and its ancestors.
+ *
+ * A path where one side is absent is left alone: that is an ordinary add or
+ * remove, which the rollup below already expresses as a single op.
+ */
+async function findKindChangeRoots(
+  changes: EntryChanges,
+  rootAHash: Uint8Array,
+  rootBHash: Uint8Array,
+  keyA: KeyString,
+  keyB: KeyString,
+  adapter: StorageAdapter
+): Promise<string[]> {
+  const changedKeys = new Set<string>([
+    ...changes.added.keys(),
+    ...changes.removed,
+    ...changes.modified.keys(),
+  ]);
+
+  const roots: string[] = [];
+  const settled = new Map<string, boolean>();
+
+  for (const key of [...changedKeys].sort()) {
+    const segments = key.split('\x00');
+
+    for (let depth = 1; depth <= segments.length; depth++) {
+      const path = segments.slice(0, depth).join('\x00');
+      if (roots.some(root => isUnderPrefix(path, root))) break;
+
+      let differs = settled.get(path);
+      if (differs === undefined) {
+        const [kindA, kindB] = await Promise.all([
+          kindOf(rootAHash, path, keyA, adapter),
+          kindOf(rootBHash, path, keyB, adapter),
+        ]);
+        // An absent side means a plain add or remove; stop descending.
+        if (kindA === 'absent' || kindB === 'absent') break;
+        differs = kindA !== kindB;
+        settled.set(path, differs);
+      }
+
+      if (differs) {
+        roots.push(path);
+        break;
+      }
+    }
+  }
+
+  return roots;
+}
+
 // ─── RFC 6902 op generation ───────────────────────────────────────────────────
 
 async function changesToOps(
@@ -198,18 +225,37 @@ async function changesToOps(
 ): Promise<jsonpatch.Operation[]> {
   const ops: jsonpatch.Operation[] = [];
 
+  // ── Kind changes ───────────────────────────────────────────────────────────
+  // A path that holds a different *kind* of value in each document — an array
+  // where the other has an object, an object where the other has a scalar —
+  // cannot be reconciled entry by entry: the entry-level adds and removes would
+  // mix with array index shifting and leave debris behind. Replace the whole
+  // value at the shallowest such path and suppress everything beneath it.
+  const shapeRoots = await findKindChangeRoots(changes, rootAHash, rootBHash, keyA, keyB, adapter);
+
+  for (const key of shapeRoots) {
+    const value = await readSubtree(rootBHash, key, keyB, adapter);
+    ops.push({
+      op: 'replace',
+      path: treeKeyToPointer(key) as string,
+      value: value === undefined ? null : value,
+    });
+  }
+
+  const suppressed = (key: string) => shapeRoots.some(root => isUnderPrefix(key, root));
+
   // ── Removes ────────────────────────────────────────────────────────────────
   const coveredRemovals = new Set<string>();
 
   for (const key of [...changes.removed].sort()) {
-    if (isCovered(key, coveredRemovals)) continue;
+    if (suppressed(key) || isCovered(key, coveredRemovals)) continue;
 
     const segments = key.split('\x00');
     let removeAt = key;
 
     for (let depth = 1; depth < segments.length; depth++) {
       const prefix = segments.slice(0, depth).join('\x00');
-      if (!(await hasKeyWithPrefix(prefix, rootBHash, keyB, adapter))) {
+      if (!(await existsPrefix(rootBHash, prefix, keyB, adapter))) {
         removeAt = prefix;
         break;
       }
@@ -227,27 +273,29 @@ async function changesToOps(
   const coveredAdds = new Set<string>();
 
   for (const key of [...changes.added.keys()].sort()) {
-    if (isCovered(key, coveredAdds)) continue;
+    if (suppressed(key) || isCovered(key, coveredAdds)) continue;
 
+    // Roll the add up to the outermost ancestor that does not exist in A, so a
+    // whole new subtree becomes one op instead of one op per leaf.
     const segments = key.split('\x00');
     let addAt = key;
-    let addValue: JSONValue = changes.added.get(key)!;
 
     for (let depth = 1; depth < segments.length; depth++) {
       const prefix = segments.slice(0, depth).join('\x00');
-      if (!(await hasKeyWithPrefix(prefix, rootAHash, keyA, adapter))) {
+      if (!(await existsPrefix(rootAHash, prefix, keyA, adapter))) {
         addAt = prefix;
-        const subEntries = [...changes.added.entries()]
-          .filter(([k]) => k === prefix || k.startsWith(prefix + '\x00'))
-          .map(([k, v]) => {
-            const rest = k === prefix ? '' : k.slice(prefix.length + 1);
-            return [rest, v] as [string, JSONValue];
-          })
-          .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
-        addValue = unflattenEntries(subEntries);
         break;
       }
     }
+
+    // Always rebuild the value from every added entry at or beneath `addAt`,
+    // including any array marker. Taking the entry's own value instead would
+    // emit the marker as the value whenever the added thing is an array.
+    const subEntries = [...changes.added.entries()]
+      .filter(([k]) => isUnderPrefix(k, addAt))
+      .map(([k, v]) => [relativeKey(k, addAt), v] as [string, StoredValue])
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    const addValue = unflattenEntries(subEntries);
 
     const pointer = treeKeyToPointer(addAt) as string;
     if (!coveredAdds.has(pointer)) {
@@ -259,7 +307,12 @@ async function changesToOps(
 
   // ── Modifies ───────────────────────────────────────────────────────────────
   for (const [key, newValue] of changes.modified) {
-    ops.push({ op: 'replace', path: treeKeyToPointer(key) as string, value: newValue });
+    if (suppressed(key)) continue;
+    ops.push({
+      op: 'replace',
+      path: treeKeyToPointer(key) as string,
+      value: newValue as JSONValue,
+    });
   }
 
   const removes = ops.filter(o => o.op === 'remove').sort((a, b) => b.path.localeCompare(a.path));

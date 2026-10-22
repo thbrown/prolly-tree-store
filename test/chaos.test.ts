@@ -2,16 +2,31 @@
  * Chaos / fuzz test.
  *
  * Runs a random sequence of put / patch / get / diff / getRootHash / delete
- * operations for CHAOS_DURATION_MS milliseconds, maintaining an independent
- * ground-truth map and asserting the adapter's output matches at each step.
+ * operations against an independent ground truth and asserts three invariants
+ * after every mutation:
+ *
+ *  1. the whole document reads back equal to the ground truth;
+ *  2. the root hash equals that of a fresh `put` of the ground truth — the
+ *     canonical-form invariant, i.e. the stored form depends only on the logical
+ *     content and never on the sequence of edits that produced it;
+ *  3. every pointer into the document reads back the value the ground truth has
+ *     at that pointer — so a partial read can never disagree with a full read.
+ *
+ * Ground truth is `fast-json-patch` itself, so RFC 6902 semantics (array index
+ * shifting in particular) are checked against a reference implementation rather
+ * than against a hand-rolled applier. Patches are generated at arbitrary depth,
+ * including array inserts, removals and appends.
  */
 
 import { describe, test, expect } from 'vitest';
+import * as jsonpatch from 'fast-json-patch';
 import { ProllyTreeStore } from '../src/partitioner.js';
 import { MemoryStorageAdapter } from '../src/adapters/memory.js';
+import { UnsupportedPatchOperationError } from '../src/errors.js';
 import type { JSONValue } from '../src/types.js';
 
-const CHAOS_DURATION_MS = 5000;
+/** Soak longer with CHAOS_MS=60000 npx vitest run test/chaos.test.ts */
+const CHAOS_DURATION_MS = Number(process.env.CHAOS_MS ?? 5000);
 
 // ─── RNG (seeded for reproducibility on failure) ──────────────────────────────
 
@@ -23,36 +38,43 @@ function makePrng(seed: number) {
   };
 }
 
+const clone = <T>(v: T): T => JSON.parse(JSON.stringify(v)) as T;
+
 // ─── Value generators ─────────────────────────────────────────────────────────
 
 function makeGenerators(r: () => number) {
   const ri = (n: number) => Math.floor(r() * n);
-  const pick = <T>(arr: T[]) => arr[ri(arr.length)];
+  const pick = <T>(arr: T[]): T => arr[ri(arr.length)];
 
   function scalar(): JSONValue {
-    const t = ri(5);
+    const t = ri(6);
     if (t === 0) return ri(100);
     if (t === 1) return `s${ri(10)}`;
     if (t === 2) return r() < 0.5;
     if (t === 3) return null;
-    return ri(1000) - 500;
+    if (t === 4) return ri(1000) - 500;
+    return '';
   }
+
+  // Object keys deliberately include numeric strings (which must NOT be read
+  // back as an array) and keys needing RFC 6901 escapes.
+  const objectKeys = ['a', 'b', 'c', 'd', '3', '0000000003', 'a/b', 'a~b', ''];
 
   function value(depth = 0): JSONValue {
-    if (depth >= 2 || r() < 0.4) return scalar();
-    if (r() < 0.6) {
-      // object
-      const keys = ['a', 'b', 'c', 'd'].slice(0, ri(3) + 1);
+    if (depth >= 3 || r() < 0.35) return scalar();
+    const shape = r();
+    if (shape < 0.15) return r() < 0.5 ? {} : [];
+    if (shape < 0.6) {
       const obj: Record<string, JSONValue> = {};
-      for (const k of keys) obj[k] = value(depth + 1);
+      for (const k of objectKeys.slice(0, ri(4) + 1)) obj[k] = value(depth + 1);
       return obj;
     }
-    // array
-    return Array.from({ length: ri(3) + 1 }, () => value(depth + 1));
+    return Array.from({ length: ri(4) }, () => value(depth + 1));
   }
 
-  function doc(): Record<string, JSONValue> {
-    const keys = ['x', 'y', 'z', 'name', 'score', 'active'].slice(0, ri(4) + 1);
+  function doc(): JSONValue {
+    if (r() < 0.1) return Array.from({ length: ri(4) }, () => value(1));
+    const keys = ['x', 'y', 'z', 'name', 'score', 'items'].slice(0, ri(5) + 1);
     const obj: Record<string, JSONValue> = {};
     for (const k of keys) obj[k] = value();
     return obj;
@@ -61,169 +83,255 @@ function makeGenerators(r: () => number) {
   return { ri, pick, scalar, value, doc };
 }
 
-// ─── Ground-truth tracker ─────────────────────────────────────────────────────
+// ─── Pointer helpers ──────────────────────────────────────────────────────────
 
-type State = { exists: false } | { exists: true; doc: Record<string, JSONValue> };
+const escapeSegment = (k: string) => k.replace(/~/g, '~0').replace(/\//g, '~1');
 
-function applyPatchToGroundTruth(
-  doc: Record<string, JSONValue>,
-  ops: Array<{ op: string; path: string; value?: JSONValue }>
-): Record<string, JSONValue> {
-  // Deep clone
-  let result = JSON.parse(JSON.stringify(doc)) as Record<string, JSONValue>;
-  for (const op of ops) {
-    const parts = op.path.split('/').slice(1); // remove leading ''
-    if (parts.length === 1) {
-      const k = parts[0];
-      if (op.op === 'replace' || op.op === 'add') result[k] = op.value!;
-      else if (op.op === 'remove') delete result[k];
+/** Every pointer into `doc`, including the root and intermediate containers. */
+function allPointers(doc: JSONValue, prefix = ''): string[] {
+  const out = [prefix];
+  if (Array.isArray(doc)) {
+    doc.forEach((v, i) => out.push(...allPointers(v, `${prefix}/${i}`)));
+  } else if (doc !== null && typeof doc === 'object') {
+    for (const [k, v] of Object.entries(doc)) {
+      out.push(...allPointers(v, `${prefix}/${escapeSegment(k)}`));
     }
-    // deeper paths not needed for top-level-only chaos ops
   }
-  return result;
+  return out;
+}
+
+/** Pointers to containers, paired with whether each is an array. */
+function containerPointers(doc: JSONValue, prefix = ''): Array<[string, boolean]> {
+  const out: Array<[string, boolean]> = [];
+  if (Array.isArray(doc)) {
+    out.push([prefix, true]);
+    doc.forEach((v, i) => out.push(...containerPointers(v, `${prefix}/${i}`)));
+  } else if (doc !== null && typeof doc === 'object') {
+    out.push([prefix, false]);
+    for (const [k, v] of Object.entries(doc)) {
+      out.push(...containerPointers(v, `${prefix}/${escapeSegment(k)}`));
+    }
+  }
+  return out;
+}
+
+function valueAtPointer(doc: JSONValue, pointer: string): JSONValue {
+  if (pointer === '') return doc;
+  let cur: JSONValue = doc;
+  for (const raw of pointer.slice(1).split('/')) {
+    const seg = raw.replace(/~1/g, '/').replace(/~0/g, '~');
+    cur = Array.isArray(cur)
+      ? (cur as JSONValue[])[Number(seg)]
+      : (cur as Record<string, JSONValue>)[seg];
+  }
+  return cur;
+}
+
+// ─── Op generation ────────────────────────────────────────────────────────────
+
+type Op = { op: string; path: string; value?: JSONValue; from?: string };
+
+function makeOps(doc: JSONValue, g: ReturnType<typeof makeGenerators>): Op[] {
+  const { ri, pick, value } = g;
+  const pointers = allPointers(doc);
+  const containers = containerPointers(doc);
+  const ops: Op[] = [];
+  const count = ri(3) + 1;
+
+  for (let i = 0; i < count; i++) {
+    // A scalar document has no containers to write into, so only whole-value
+    // ops make sense there.
+    const kind = containers.length === 0 ? 2 + ri(5) : ri(7);
+    const [containerPath, isArray] = containers.length > 0 ? pick(containers) : ['', false];
+
+    if (kind === 0) {
+      // add — a new object key, or an array insert/append
+      if (isArray) {
+        const length = (valueAtPointer(doc, containerPath) as JSONValue[]).length;
+        const index = ri(2) === 0 ? '-' : String(ri(length + 1));
+        ops.push({ op: 'add', path: `${containerPath}/${index}`, value: value(1) });
+      } else {
+        ops.push({
+          op: 'add',
+          path: `${containerPath}/${escapeSegment(pick(['a', 'b', 'new', '7', 'k/1']))}`,
+          value: value(1),
+        });
+      }
+    } else if (kind === 1) {
+      const removable = pointers.filter(p => p !== '');
+      if (removable.length > 0) ops.push({ op: 'remove', path: pick(removable) });
+    } else if (kind === 2) {
+      ops.push({ op: 'replace', path: pick(pointers), value: value(1) });
+    } else if (kind === 3) {
+      const from = pick(pointers);
+      ops.push({ op: 'move', from, path: pick(pointers) });
+    } else if (kind === 4) {
+      const from = pick(pointers);
+      ops.push({ op: 'copy', from, path: pick(pointers) });
+    } else if (kind === 5) {
+      const path = pick(pointers);
+      ops.push({ op: 'test', path, value: clone(valueAtPointer(doc, path)) });
+    } else {
+      ops.push({ op: 'replace', path: '', value: value(1) });
+    }
+  }
+
+  return ops;
 }
 
 // ─── Chaos loop ───────────────────────────────────────────────────────────────
 
 describe('Chaos: random operation sequences', () => {
   test(`runs for ${CHAOS_DURATION_MS}ms without error or inconsistency`, async () => {
-    const seed = Date.now() & 0xFFFFFFFF;
+    const seed = Date.now() & 0xffffffff;
     const r = makePrng(seed);
-    const { ri, pick, scalar, doc } = makeGenerators(r);
+    const g = makeGenerators(r);
+    const { ri, pick } = g;
 
     const adapter = new MemoryStorageAdapter();
-    const p = new ProllyTreeStore({
+    const store = new ProllyTreeStore({
       adapter,
-      initialState: { chunkSize: 512, prefetchWidth: 2 },
+      initialState: { chunkSize: 512, prefetchWidth: 2 } as never,
     });
 
     const docKeys = ['chaos-a', 'chaos-b', 'chaos-c'].map(ProllyTreeStore.asKey);
-    const state = new Map<string, State>(docKeys.map(k => [k as string, { exists: false }]));
+    const truth = new Map<string, JSONValue | undefined>(docKeys.map(k => [k as string, undefined]));
 
-    const counters = { put: 0, patch: 0, get: 0, diff: 0, getRootHash: 0, delete: 0, errors: 0 };
+    const counters = {
+      put: 0, patch: 0, patchRejected: 0, get: 0, diff: 0, getRootHash: 0, delete: 0,
+    };
+    let step = 0;
+    let lastOps: unknown = null;
+
+    /** Assert the three invariants for one document. */
+    const check = async (key: ReturnType<typeof ProllyTreeStore.asKey>) => {
+      const expected = truth.get(key as string)!;
+
+      expect(await store.get(key)).toEqual(expected);
+
+      const probe = ProllyTreeStore.asKey(`canon-${ri(1_000_000)}`);
+      await store.put(probe, clone(expected));
+      expect(await store.getRootHash(key)).toBe(await store.getRootHash(probe));
+      await store.delete(probe);
+
+      for (const pointer of allPointers(expected)) {
+        const actual = await store.get(key, ProllyTreeStore.asPointer(pointer));
+        expect(actual).toEqual(valueAtPointer(expected, pointer));
+      }
+    };
 
     const deadline = Date.now() + CHAOS_DURATION_MS;
 
-    while (Date.now() < deadline) {
-      const key = pick(docKeys);
-      const ks = key as string;
-      const cur = state.get(ks)!;
-      const op = ri(cur.exists ? 6 : 2); // bias toward put/get when nothing exists
+    try {
+      while (Date.now() < deadline) {
+        step++;
+        const key = pick(docKeys);
+        const ks = key as string;
+        const current = truth.get(ks);
+        const op = ri(current === undefined ? 2 : 6);
 
-      try {
-        // ── put ───────────────────────────────────────────────────────────────
+        // ── put ─────────────────────────────────────────────────────────────
         if (op === 0) {
-          const newDoc = doc();
-          await p.put(key, newDoc);
-          state.set(ks, { exists: true, doc: newDoc });
+          const next = g.doc();
+          await store.put(key, clone(next));
+          truth.set(ks, next);
           counters.put++;
+          await check(key);
         }
 
-        // ── get (verify) ──────────────────────────────────────────────────────
+        // ── get ─────────────────────────────────────────────────────────────
         else if (op === 1) {
-          if (cur.exists) {
-            const result = await p.get(key);
-            expect(result).toEqual(cur.doc);
-          }
+          if (current !== undefined) await check(key);
           counters.get++;
         }
 
-        // ── patch (top-level replace/add/remove) ──────────────────────────────
-        else if (op === 2 && cur.exists) {
-          const keys = Object.keys(cur.doc);
-          const patchOp = ri(3);
+        // ── patch at arbitrary depth ────────────────────────────────────────
+        else if (op === 2 && current !== undefined) {
+          const ops = makeOps(current, g);
+          lastOps = ops;
 
-          let ops: Array<{ op: string; path: string; value?: JSONValue }>;
-
-          if (patchOp === 0 && keys.length > 0) {
-            // replace a random existing key
-            const k = pick(keys);
-            const newVal = scalar();
-            ops = [{ op: 'replace', path: `/${k}`, value: newVal }];
-          } else if (patchOp === 1) {
-            // add a new key
-            const newKey = `new_${ri(5)}`;
-            const newVal = scalar();
-            ops = [{ op: 'add', path: `/${newKey}`, value: newVal }];
-          } else if (patchOp === 2 && keys.length > 1) {
-            // remove a key (keep at least 1)
-            const k = pick(keys);
-            ops = [{ op: 'remove', path: `/${k}` }];
-          } else {
-            ops = [];
+          // Only ops the reference implementation accepts are sent to the
+          // store; invalid ones are covered by test/array-semantics.test.ts.
+          let expected: JSONValue;
+          try {
+            expected = jsonpatch.applyPatch(clone(current), clone(ops) as never, true)
+              .newDocument as JSONValue;
+          } catch {
+            counters.patchRejected++;
+            continue;
           }
 
-          if (ops.length > 0) {
-            await p.patch(key, JSON.stringify(ops) as any);
-            const newDoc = applyPatchToGroundTruth(cur.doc, ops);
-            state.set(ks, { exists: true, doc: newDoc });
+          // This library is stricter than the reference on malformed targets
+          // (adding a member to a scalar, an out-of-range array index). When it
+          // rejects, the rejection must be atomic: nothing changed.
+          try {
+            await store.patch(key, JSON.stringify(ops) as never);
+          } catch (e) {
+            if (!(e instanceof UnsupportedPatchOperationError)) throw e;
+            expect(await store.get(key)).toEqual(current);
+            counters.patchRejected++;
+            continue;
           }
+
+          truth.set(ks, expected);
           counters.patch++;
+          await check(key);
         }
 
-        // ── getRootHash ───────────────────────────────────────────────────────
-        else if (op === 3 && cur.exists) {
-          const hash = await p.getRootHash(key);
-          expect(hash).toMatch(/^[0-9a-f]{64}$/);
+        // ── getRootHash ─────────────────────────────────────────────────────
+        else if (op === 3 && current !== undefined) {
+          expect(await store.getRootHash(key)).toMatch(/^[0-9a-f]{64}$/);
           counters.getRootHash++;
         }
 
-        // ── diff + patch symmetry ─────────────────────────────────────────────
+        // ── diff + patch symmetry ───────────────────────────────────────────
         else if (op === 4) {
-          // Pick two keys that both exist
-          const existing = docKeys.filter(k => (state.get(k as string) as State).exists);
+          const existing = docKeys.filter(k => truth.get(k as string) !== undefined);
           if (existing.length >= 2) {
-            const [kA, kB] = [pick(existing), pick(existing)];
-            const kAs = kA as string;
-            const kBs = kB as string;
+            const keyA = pick(existing);
+            const keyB = pick(existing.filter(k => k !== keyA));
+            if (keyB !== undefined) {
+              const patchDoc = await store.diff(keyA, keyB);
+              lastOps = patchDoc;
 
-            if (kAs !== kBs) {
-              const patch = await p.diff(kA, kB);
-              const ops = JSON.parse(patch as string);
+              const temp = ProllyTreeStore.asKey(`chaos-tmp-${ri(1_000_000)}`);
+              await store.put(temp, clone(truth.get(keyA as string)!));
+              if (JSON.parse(patchDoc as string).length > 0) await store.patch(temp, patchDoc);
 
-              // Apply diff(A, B) to a copy of A stored under a temp key
-              const tempKey = ProllyTreeStore.asKey(`chaos-tmp-${ri(1000)}`);
-              const docA = (state.get(kAs) as { exists: true; doc: Record<string, JSONValue> }).doc;
-              const docB = (state.get(kBs) as { exists: true; doc: Record<string, JSONValue> }).doc;
+              const docB = truth.get(keyB as string)!;
+              expect(await store.get(temp)).toEqual(docB);
+              // diff must close the gap exactly, not merely produce equal JSON
+              expect(await store.getRootHash(temp)).toBe(await store.getRootHash(keyB));
+              expect(await store.diff(temp, keyB)).toBe('[]');
 
-              await p.put(tempKey, docA);
-              if (ops.length > 0) await p.patch(tempKey, patch);
-
-              const result = await p.get(tempKey);
-              expect(result).toEqual(docB);
-
-              await p.delete(tempKey);
+              await store.delete(temp);
             }
           }
           counters.diff++;
         }
 
-        // ── delete ────────────────────────────────────────────────────────────
-        else if (op === 5 && cur.exists) {
-          await p.delete(key);
-          state.set(ks, { exists: false });
+        // ── delete ──────────────────────────────────────────────────────────
+        else if (op === 5 && current !== undefined) {
+          await store.delete(key);
+          truth.set(ks, undefined);
           counters.delete++;
         }
-      } catch (e) {
-        counters.errors++;
-        throw new Error(`Chaos failure (seed=${seed}): op=${op} key=${ks}\n${e}`);
       }
+    } catch (e) {
+      throw new Error(
+        `Chaos failure (seed=${seed}) at step ${step}\n` +
+          `ops: ${JSON.stringify(lastOps)}\n` +
+          `${e instanceof Error ? e.stack : String(e)}`
+      );
     }
 
-    // Final consistency check: verify all existing docs still read correctly
-    for (const [ks, s] of state) {
-      if (s.exists) {
-        const result = await p.get(ProllyTreeStore.asKey(ks));
-        expect(result).toEqual(s.doc);
-      }
-    }
+    // The run is only meaningful if it actually exercised the interesting paths.
+    expect(counters.put).toBeGreaterThan(0);
+    expect(counters.patch).toBeGreaterThan(0);
+    expect(counters.diff).toBeGreaterThan(0);
 
-    const total = Object.values(counters).reduce((a, b) => a + b, 0);
-    console.log(
-      `Chaos done (seed=${seed}): ${total} ops — ` +
-      Object.entries(counters).map(([k, v]) => `${k}=${v}`).join(', ')
-    );
-
-    expect(counters.errors).toBe(0);
-  }, CHAOS_DURATION_MS + 5000); // vitest timeout = run time + 5s buffer
+    // Deleting every document must leave no blobs behind except calibration.
+    for (const key of docKeys) await store.delete(key);
+    expect(adapter.keys().filter(k => !k.startsWith('__calibration__'))).toEqual([]);
+  }, CHAOS_DURATION_MS + 60_000);
 });
