@@ -1,6 +1,6 @@
 {
   "name": "prolly-tree-store",
-  "version": "1.0.1",
+  "version": "2.0.0",
   "description": "Merkle Prolly Tree storage library for syncing large JSON documents efficiently",
   "type": "module",
   "main": "./dist/index.js",
@@ -26,6 +26,7 @@
     "prepublishOnly": "npm run build && npm run test:ci",
     "test": "vitest --coverage run",
     "test:ci": "vitest run",
+    "diagrams": "node tools/diagrams/build.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

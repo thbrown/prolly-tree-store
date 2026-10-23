@@ -10,6 +10,7 @@ import {
   blobToNodeBytes,
 } from '../src/serialization.js';
 import type { LeafNode, InternalNode, RootPointer } from '../src/types.js';
+import { FORMAT_VERSION } from '../src/types.js';
 
 describe('encodeValue / decodeValue', () => {
   const cases: [string, unknown][] = [
@@ -58,34 +59,54 @@ describe('encodeNode / decodeNode — LeafNode', () => {
 });
 
 describe('encodeNode / decodeNode — InternalNode', () => {
-  test('roundtrip preserves level, keys, children', () => {
-    const internal: InternalNode = {
-      type: 0x01,
-      chunkHash: new Uint8Array(32).fill(3),
-      entryHash: new Uint8Array(32).fill(4),
-      level: 1,
-      keys: ['b', 'd'],
-      children: [
-        new Uint8Array(32).fill(10),
-        new Uint8Array(32).fill(11),
-        new Uint8Array(32).fill(12),
-      ],
-    };
+  const internal: InternalNode = {
+    type: 0x01,
+    chunkHash: new Uint8Array(32).fill(3),
+    entryHash: new Uint8Array(32).fill(4),
+    level: 1,
+    keys: ['b', 'd', 'f'],
+    children: [
+      new Uint8Array(32).fill(10),
+      new Uint8Array(32).fill(11),
+      new Uint8Array(32).fill(12),
+    ],
+    childEntryHashes: [
+      new Uint8Array(32).fill(20),
+      new Uint8Array(32).fill(21),
+      new Uint8Array(32).fill(22),
+    ],
+  };
 
-    const bytes = encodeNode(internal);
-    const decoded = decodeNode(bytes, internal.chunkHash) as InternalNode;
+  test('roundtrip preserves level, keys and children', () => {
+    const decoded = decodeNode(encodeNode(internal), internal.chunkHash) as InternalNode;
 
     expect(decoded.type).toBe(0x01);
     expect(decoded.level).toBe(1);
-    expect(decoded.keys).toEqual(['b', 'd']);
+    expect(decoded.keys).toEqual(['b', 'd', 'f']);
     expect(decoded.children).toHaveLength(3);
     expect(decoded.children[0]).toEqual(internal.children[0]);
+  });
+
+  test('roundtrip preserves each child entry hash', () => {
+    // Carried so that patch can split or drop a node without reading siblings.
+    const decoded = decodeNode(encodeNode(internal), internal.chunkHash) as InternalNode;
+
+    expect(decoded.childEntryHashes).toHaveLength(3);
+    expect(decoded.childEntryHashes[1]).toEqual(internal.childEntryHashes[1]);
+  });
+
+  test('one key, child and entry hash per child', () => {
+    const decoded = decodeNode(encodeNode(internal), internal.chunkHash) as InternalNode;
+
+    expect(decoded.keys).toHaveLength(decoded.children.length);
+    expect(decoded.childEntryHashes).toHaveLength(decoded.children.length);
   });
 });
 
 describe('encodeRootPointer / decodeRootPointer', () => {
   test('roundtrip', () => {
     const root: RootPointer = {
+      format: FORMAT_VERSION,
       chunkHash: new Uint8Array(32).fill(0xab),
       entryHash: new Uint8Array(32).fill(0xcd),
       chunkSize: 4096,

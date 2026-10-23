@@ -2,18 +2,21 @@ import type {
   StorageAdapter,
   KeyString,
   JSONValue,
+  StoredValue,
   ContentHash,
-  LeafNode,
-  InternalNode,
   RootPointer,
+  JSONPointer,
 } from './types.js';
 import { toKey } from './types.js';
 import { BlobNotFoundError } from './errors.js';
 import { decodeRootPointer, decodeValue } from './serialization.js';
 import { entryHashToContentHash } from './hashing.js';
-import { pointerToTreeKey, unflattenEntries } from './encoding.js';
-import type { JSONPointer } from './types.js';
-import { rootKey, chunkKey, fetchNode } from './tree-utils.js';
+import { unflattenEntries, relativeKey } from './encoding.js';
+import { resolvePointer } from './pointer.js';
+import { treeReader, scanPrefix } from './prefix-scan.js';
+import { newNodeCache } from './tree-utils.js';
+import type { NodeCache } from './tree-utils.js';
+import { rootKey } from './tree-utils.js';
 
 async function fetchRootPointer(
   key: KeyString,
@@ -36,10 +39,33 @@ export async function getRootHash(
 }
 
 /**
- * Retrieve a full document or sub-tree at `pointer`.
+ * Rebuild the JSON value stored at `treeKey`, or undefined if nothing is there.
+ * Fetches only the nodes covering that key's subtree.
+ */
+export async function readSubtree(
+  rootHash: Uint8Array,
+  treeKey: string,
+  docKey: KeyString,
+  adapter: StorageAdapter,
+  cache?: NodeCache
+): Promise<JSONValue | undefined> {
+  const entries = await scanPrefix(rootHash, treeKey, docKey, adapter, cache);
+  if (entries.length === 0) return undefined;
+
+  return unflattenEntries(
+    entries.map(
+      e => [relativeKey(e.key, treeKey), decodeValue(e.valueMsgpack)] as [string, StoredValue]
+    )
+  );
+}
+
+/**
+ * Retrieve a full document or the sub-value at `pointer`.
  *
- * Without `pointer` (or empty string): returns the entire stored document.
- * With `pointer`: walks only the subtree covering that key prefix.
+ * Without `pointer` (or with an empty one): returns the entire stored document.
+ * With `pointer`: resolves it against the stored container shapes (so a numeric
+ * segment indexes an array only where an array is actually stored) and walks
+ * only the subtree covering that key.
  */
 export async function get(
   key: KeyString,
@@ -48,84 +74,20 @@ export async function get(
 ): Promise<JSONValue> {
   const rootPtr = await fetchRootPointer(key, adapter);
 
-  const treeKeyPrefix = pointer ? pointerToTreeKey(pointer) : '';
-
-  const entries = await collectEntries(rootPtr.chunkHash, treeKeyPrefix, key, adapter);
-
-  if (entries.length === 0) {
-    if (pointer && pointer !== '' as JSONPointer) {
-      throw new BlobNotFoundError(toKey(`${key as string}${pointer as string}`));
-    }
-    return {};
+  if (pointer === undefined || (pointer as string) === '') {
+    const value = await readSubtree(rootPtr.chunkHash, '', key, adapter);
+    return value === undefined ? {} : value;
   }
 
-  if (!pointer || pointer === '' as JSONPointer) {
-    return unflattenEntries(entries);
+  // Resolving the pointer and reading the target share every node above the
+  // leaf, so one cache serves both walks.
+  const cache = newNodeCache();
+  const reader = treeReader(rootPtr.chunkHash, key, adapter, cache);
+  const resolved = await resolvePointer(pointer, reader);
+
+  const value = await readSubtree(rootPtr.chunkHash, resolved.treeKey, key, adapter, cache);
+  if (value === undefined) {
+    throw new BlobNotFoundError(toKey(`${key as string}${pointer as string}`));
   }
-
-  const prefix = treeKeyPrefix;
-  const subEntries = entries
-    .filter(([k]) => k === prefix || k.startsWith(prefix === '' ? '' : prefix + '\x00'))
-    .map(([k, v]) => {
-      const rest = prefix === '' ? k : k.slice(prefix.length + 1);
-      return [rest, v] as [string, JSONValue];
-    });
-
-  if (subEntries.length === 1 && subEntries[0][0] === '') {
-    return subEntries[0][1];
-  }
-
-  const exact = entries.find(([k]) => k === prefix);
-  if (exact) return exact[1];
-
-  return unflattenEntries(subEntries);
-}
-
-async function collectEntries(
-  chunkHashBytes: Uint8Array,
-  prefix: string,
-  docKey: KeyString,
-  adapter: StorageAdapter,
-): Promise<[string, JSONValue][]> {
-  const node = await fetchNode(chunkHashBytes, docKey, adapter);
-
-  if (node.type === 0x02) {
-    const leaf = node as LeafNode;
-    return leaf.entries
-      .filter(e => prefix === '' || e.key === prefix || e.key.startsWith(prefix + '\x00'))
-      .map(e => [e.key, decodeValue(e.valueMsgpack)] as [string, JSONValue]);
-  }
-
-  const internal = node as InternalNode;
-  const relevantChildren = findRelevantChildren(internal, prefix);
-
-  const childArrays = await Promise.all(
-    relevantChildren.map(({ chunkHash }) => collectEntries(chunkHash, prefix, docKey, adapter))
-  );
-  return childArrays.flat();
-}
-
-function findRelevantChildren(
-  node: InternalNode,
-  prefix: string
-): { chunkHash: Uint8Array }[] {
-  if (prefix === '') {
-    return node.children.map(chunkHash => ({ chunkHash }));
-  }
-
-  const result: { chunkHash: Uint8Array }[] = [];
-
-  for (let i = 0; i < node.children.length; i++) {
-    const lo = i === 0 ? '' : node.keys[i - 1];
-    const hi = i < node.keys.length ? node.keys[i] : null;
-
-    const loOk = lo === '' || lo <= prefix || lo.startsWith(prefix) || prefix.startsWith(lo);
-    const hiOk = hi === null || hi > prefix;
-
-    if (loOk && hiOk) {
-      result.push({ chunkHash: node.children[i] });
-    }
-  }
-
-  return result;
+  return value;
 }

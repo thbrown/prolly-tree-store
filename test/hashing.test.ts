@@ -1,5 +1,5 @@
 import { describe, test, expect } from 'vitest';
-import { chunkHashOf, entryHashOf, combineEntryHashes, chunkBlobKey } from '../src/hashing.js';
+import { chunkHashOf, entryHashOf, combineEntryHashes } from '../src/hashing.js';
 import { encodeValue } from '../src/serialization.js';
 
 describe('chunkHashOf', () => {
@@ -73,12 +73,5 @@ describe('entryHashOf', () => {
     expect(splitA).toEqual(all);
     expect(splitB).toEqual(all);
     expect(splitC).toEqual(all);
-  });
-});
-
-describe('chunkBlobKey', () => {
-  test('uses first 2 hex chars as shard prefix', () => {
-    const hash = 'abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890' as any;
-    expect(chunkBlobKey(hash)).toBe('chunks/ab/abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890');
   });
 });

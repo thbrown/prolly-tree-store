@@ -2,18 +2,19 @@ import type {
   StorageAdapter,
   KeyString,
   JSONValue,
+  StoredValue,
   JSONPatchDocument,
   LeafNode,
   InternalNode,
 } from './types.js';
 import { toPatch } from './types.js';
-import {
-  decodeRootPointer,
-  decodeValue,
-} from './serialization.js';
-import { unflattenEntries, treeKeyToPointer } from './encoding.js';
+import { decodeRootPointer, decodeValue } from './serialization.js';
+import { unflattenEntries, treeKeyToPointer, isUnderPrefix, relativeKey } from './encoding.js';
 import * as jsonpatch from 'fast-json-patch';
-import { rootKey, fetchNode } from './tree-utils.js';
+import { rootKey, fetchNode, newNodeCache } from './tree-utils.js';
+import type { NodeCache } from './tree-utils.js';
+import { existsPrefix, kindOf } from './prefix-scan.js';
+import { readSubtree } from './tree-read.js';
 
 function arraysEqual(a: Uint8Array, b: Uint8Array): boolean {
   if (a.length !== b.length) return false;
@@ -26,56 +27,39 @@ function arraysEqual(a: Uint8Array, b: Uint8Array): boolean {
 async function collectAllLeafEntries(
   chunkHashBytes: Uint8Array,
   docKey: KeyString,
-  adapter: StorageAdapter
+  adapter: StorageAdapter,
+  cache: NodeCache
 ): Promise<Map<string, Uint8Array>> {
-  const node = await fetchNode(chunkHashBytes, docKey, adapter);
+  const node = await fetchNode(chunkHashBytes, docKey, adapter, cache);
   if (node.type === 0x02) {
     const leaf = node as LeafNode;
     return new Map(leaf.entries.map(e => [e.key, e.valueMsgpack]));
   }
   const internal = node as InternalNode;
   const childMaps = await Promise.all(
-    internal.children.map(ch => collectAllLeafEntries(ch, docKey, adapter))
+    internal.children.map(ch => collectAllLeafEntries(ch, docKey, adapter, cache))
   );
   const result = new Map<string, Uint8Array>();
   for (const m of childMaps) for (const [k, v] of m) result.set(k, v);
   return result;
 }
 
-async function hasKeyWithPrefix(
-  prefix: string,
-  chunkHashBytes: Uint8Array,
-  docKey: KeyString,
-  adapter: StorageAdapter
-): Promise<boolean> {
-  const node = await fetchNode(chunkHashBytes, docKey, adapter);
-
-  if (node.type === 0x02) {
-    const leaf = node as LeafNode;
-    return leaf.entries.some(
-      e => e.key === prefix || e.key.startsWith(prefix + '\x00')
-    );
-  }
-
-  const internal = node as InternalNode;
-  for (let i = 0; i < internal.children.length; i++) {
-    const lo = i === 0 ? '' : internal.keys[i - 1];
-    const hi = i < internal.keys.length ? internal.keys[i] : null;
-    const loOk = lo === '' || lo <= prefix || lo.startsWith(prefix) || prefix.startsWith(lo + '\x00') || prefix >= lo;
-    const hiOk = hi === null || hi > prefix || hi.startsWith(prefix);
-    if (loOk && hiOk) {
-      if (await hasKeyWithPrefix(prefix, internal.children[i], docKey, adapter)) return true;
-    }
-  }
-  return false;
-}
-
 // ─── Entry-level change collection ───────────────────────────────────────────
 
+/**
+ * One decoded-node cache per document, reused across every walk a single diff
+ * performs. Without it the ancestor probes below re-read the path from the root
+ * for each changed key, which costs more than reading the whole document.
+ */
+interface DiffCaches {
+  a: NodeCache;
+  b: NodeCache;
+}
+
 interface EntryChanges {
-  added: Map<string, JSONValue>;
+  added: Map<string, StoredValue>;
   removed: Set<string>;
-  modified: Map<string, JSONValue>;
+  modified: Map<string, StoredValue>;
 }
 
 /**
@@ -88,13 +72,14 @@ async function walkChanges(
   keyA: KeyString,
   keyB: KeyString,
   adapter: StorageAdapter,
-  result: EntryChanges
+  result: EntryChanges,
+  caches: DiffCaches
 ): Promise<void> {
   if (arraysEqual(hashA, hashB)) return;
 
   const [nodeA, nodeB] = await Promise.all([
-    fetchNode(hashA, keyA, adapter),
-    fetchNode(hashB, keyB, adapter),
+    fetchNode(hashA, keyA, adapter, caches.a),
+    fetchNode(hashB, keyB, adapter, caches.b),
   ]);
 
   if (nodeA.type === 0x02 && nodeB.type === 0x02) {
@@ -103,14 +88,14 @@ async function walkChanges(
   }
 
   if (nodeA.type === 0x01 && nodeB.type === 0x01) {
-    await diffInternalNodes(nodeA as InternalNode, nodeB as InternalNode, keyA, keyB, adapter, result);
+    await diffInternalNodes(nodeA as InternalNode, nodeB as InternalNode, keyA, keyB, adapter, result, caches);
     return;
   }
 
   // Mixed levels — collect everything from both sides
   const [entriesA, entriesB] = await Promise.all([
-    collectAllLeafEntries(hashA, keyA, adapter),
-    collectAllLeafEntries(hashB, keyB, adapter),
+    collectAllLeafEntries(hashA, keyA, adapter, caches.a),
+    collectAllLeafEntries(hashB, keyB, adapter, caches.b),
   ]);
   mergeEntryMaps(entriesA, entriesB, result);
 }
@@ -163,7 +148,8 @@ async function diffInternalNodes(
   keyA: KeyString,
   keyB: KeyString,
   adapter: StorageAdapter,
-  result: EntryChanges
+  result: EntryChanges,
+  caches: DiffCaches
 ): Promise<void> {
   const sameStructure =
     nodeA.keys.length === nodeB.keys.length &&
@@ -173,17 +159,73 @@ async function diffInternalNodes(
     const tasks: Promise<void>[] = [];
     for (let i = 0; i < nodeA.children.length; i++) {
       if (!arraysEqual(nodeA.children[i], nodeB.children[i])) {
-        tasks.push(walkChanges(nodeA.children[i], nodeB.children[i], keyA, keyB, adapter, result));
+        tasks.push(walkChanges(nodeA.children[i], nodeB.children[i], keyA, keyB, adapter, result, caches));
       }
     }
     await Promise.all(tasks);
   } else {
     const [entriesA, entriesB] = await Promise.all([
-      collectAllLeafEntries(nodeA.chunkHash, keyA, adapter),
-      collectAllLeafEntries(nodeB.chunkHash, keyB, adapter),
+      collectAllLeafEntries(nodeA.chunkHash, keyA, adapter, caches.a),
+      collectAllLeafEntries(nodeB.chunkHash, keyB, adapter, caches.b),
     ]);
     mergeEntryMaps(entriesA, entriesB, result);
   }
+}
+
+// ─── Kind-change detection ────────────────────────────────────────────────────
+
+/**
+ * The shallowest paths at which the two documents disagree about the kind of
+ * value stored, considering every changed key and its ancestors.
+ *
+ * A path where one side is absent is left alone: that is an ordinary add or
+ * remove, which the rollup below already expresses as a single op.
+ */
+async function findKindChangeRoots(
+  changes: EntryChanges,
+  rootAHash: Uint8Array,
+  rootBHash: Uint8Array,
+  keyA: KeyString,
+  keyB: KeyString,
+  adapter: StorageAdapter,
+  caches: DiffCaches
+): Promise<string[]> {
+  const changedKeys = new Set<string>([
+    ...changes.added.keys(),
+    ...changes.removed,
+    ...changes.modified.keys(),
+  ]);
+
+  const roots: string[] = [];
+  const settled = new Map<string, boolean>();
+
+  for (const key of [...changedKeys].sort()) {
+    const segments = key.split('\x00');
+
+    for (let depth = 1; depth <= segments.length; depth++) {
+      const path = segments.slice(0, depth).join('\x00');
+      if (roots.some(root => isUnderPrefix(path, root))) break;
+
+      let differs = settled.get(path);
+      if (differs === undefined) {
+        const [kindA, kindB] = await Promise.all([
+          kindOf(rootAHash, path, keyA, adapter, caches.a),
+          kindOf(rootBHash, path, keyB, adapter, caches.b),
+        ]);
+        // An absent side means a plain add or remove; stop descending.
+        if (kindA === 'absent' || kindB === 'absent') break;
+        differs = kindA !== kindB;
+        settled.set(path, differs);
+      }
+
+      if (differs) {
+        roots.push(path);
+        break;
+      }
+    }
+  }
+
+  return roots;
 }
 
 // ─── RFC 6902 op generation ───────────────────────────────────────────────────
@@ -194,22 +236,42 @@ async function changesToOps(
   rootBHash: Uint8Array,
   keyA: KeyString,
   keyB: KeyString,
-  adapter: StorageAdapter
+  adapter: StorageAdapter,
+  caches: DiffCaches
 ): Promise<jsonpatch.Operation[]> {
   const ops: jsonpatch.Operation[] = [];
+
+  // ── Kind changes ───────────────────────────────────────────────────────────
+  // A path that holds a different *kind* of value in each document — an array
+  // where the other has an object, an object where the other has a scalar —
+  // cannot be reconciled entry by entry: the entry-level adds and removes would
+  // mix with array index shifting and leave debris behind. Replace the whole
+  // value at the shallowest such path and suppress everything beneath it.
+  const shapeRoots = await findKindChangeRoots(changes, rootAHash, rootBHash, keyA, keyB, adapter, caches);
+
+  for (const key of shapeRoots) {
+    const value = await readSubtree(rootBHash, key, keyB, adapter, caches.b);
+    ops.push({
+      op: 'replace',
+      path: treeKeyToPointer(key) as string,
+      value: value === undefined ? null : value,
+    });
+  }
+
+  const suppressed = (key: string) => shapeRoots.some(root => isUnderPrefix(key, root));
 
   // ── Removes ────────────────────────────────────────────────────────────────
   const coveredRemovals = new Set<string>();
 
   for (const key of [...changes.removed].sort()) {
-    if (isCovered(key, coveredRemovals)) continue;
+    if (suppressed(key) || isCovered(key, coveredRemovals)) continue;
 
     const segments = key.split('\x00');
     let removeAt = key;
 
     for (let depth = 1; depth < segments.length; depth++) {
       const prefix = segments.slice(0, depth).join('\x00');
-      if (!(await hasKeyWithPrefix(prefix, rootBHash, keyB, adapter))) {
+      if (!(await existsPrefix(rootBHash, prefix, keyB, adapter, false, caches.b))) {
         removeAt = prefix;
         break;
       }
@@ -227,27 +289,29 @@ async function changesToOps(
   const coveredAdds = new Set<string>();
 
   for (const key of [...changes.added.keys()].sort()) {
-    if (isCovered(key, coveredAdds)) continue;
+    if (suppressed(key) || isCovered(key, coveredAdds)) continue;
 
+    // Roll the add up to the outermost ancestor that does not exist in A, so a
+    // whole new subtree becomes one op instead of one op per leaf.
     const segments = key.split('\x00');
     let addAt = key;
-    let addValue: JSONValue = changes.added.get(key)!;
 
     for (let depth = 1; depth < segments.length; depth++) {
       const prefix = segments.slice(0, depth).join('\x00');
-      if (!(await hasKeyWithPrefix(prefix, rootAHash, keyA, adapter))) {
+      if (!(await existsPrefix(rootAHash, prefix, keyA, adapter, false, caches.a))) {
         addAt = prefix;
-        const subEntries = [...changes.added.entries()]
-          .filter(([k]) => k === prefix || k.startsWith(prefix + '\x00'))
-          .map(([k, v]) => {
-            const rest = k === prefix ? '' : k.slice(prefix.length + 1);
-            return [rest, v] as [string, JSONValue];
-          })
-          .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
-        addValue = unflattenEntries(subEntries);
         break;
       }
     }
+
+    // Always rebuild the value from every added entry at or beneath `addAt`,
+    // including any array marker. Taking the entry's own value instead would
+    // emit the marker as the value whenever the added thing is an array.
+    const subEntries = [...changes.added.entries()]
+      .filter(([k]) => isUnderPrefix(k, addAt))
+      .map(([k, v]) => [relativeKey(k, addAt), v] as [string, StoredValue])
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    const addValue = unflattenEntries(subEntries);
 
     const pointer = treeKeyToPointer(addAt) as string;
     if (!coveredAdds.has(pointer)) {
@@ -259,7 +323,12 @@ async function changesToOps(
 
   // ── Modifies ───────────────────────────────────────────────────────────────
   for (const [key, newValue] of changes.modified) {
-    ops.push({ op: 'replace', path: treeKeyToPointer(key) as string, value: newValue });
+    if (suppressed(key)) continue;
+    ops.push({
+      op: 'replace',
+      path: treeKeyToPointer(key) as string,
+      value: newValue as JSONValue,
+    });
   }
 
   const removes = ops.filter(o => o.op === 'remove').sort((a, b) => b.path.localeCompare(a.path));
@@ -302,18 +371,20 @@ export async function diff(
 
   if (arraysEqual(rootA.entryHash, rootB.entryHash)) return toPatch('[]');
 
+  const caches: DiffCaches = { a: newNodeCache(), b: newNodeCache() };
+
   const changes: EntryChanges = {
     added: new Map(),
     removed: new Set(),
     modified: new Map(),
   };
 
-  await walkChanges(rootA.chunkHash, rootB.chunkHash, keyA, keyB, adapter, changes);
+  await walkChanges(rootA.chunkHash, rootB.chunkHash, keyA, keyB, adapter, changes, caches);
 
   if (changes.added.size === 0 && changes.removed.size === 0 && changes.modified.size === 0) {
     return toPatch('[]');
   }
 
-  const ops = await changesToOps(changes, rootA.chunkHash, rootB.chunkHash, keyA, keyB, adapter);
+  const ops = await changesToOps(changes, rootA.chunkHash, rootB.chunkHash, keyA, keyB, adapter, caches);
   return toPatch(JSON.stringify(ops));
 }

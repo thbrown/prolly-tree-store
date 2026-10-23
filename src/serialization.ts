@@ -1,19 +1,48 @@
-import { encode, decode } from '@msgpack/msgpack';
+import { encode, decode, ExtData } from '@msgpack/msgpack';
 import type { LeafNode, InternalNode, TreeNode, RootPointer, LeafEntry } from './types.js';
-import { toBlob } from './types.js';
-import type { JSONBlob, JSONValue } from './types.js';
+import { toBlob, ARRAY_MARKER, FORMAT_VERSION } from './types.js';
+import type { JSONBlob, JSONValue, StoredValue } from './types.js';
 import { toHex, hexToBytes } from './hashing.js';
+import { UnsupportedFormatError } from './errors.js';
 
 const NODE_TYPE_LEAF = 0x02;
 const NODE_TYPE_INTERNAL = 0x01;
 
-// ─── JSON value ↔ MessagePack ─────────────────────────────────────────────────
+// ─── Stored value ↔ MessagePack ───────────────────────────────────────────────
 
-export function encodeValue(value: JSONValue): Uint8Array {
-  return encode(value);
+/**
+ * msgpack extension type reserved for the array marker. Extension types are
+ * unreachable from JSON, so the encoding of the marker cannot collide with the
+ * encoding of any document value.
+ */
+const ARRAY_MARKER_EXT_TYPE = 0x01;
+
+/** Encoded form of ARRAY_MARKER: the 3 bytes [0xc7, 0x00, 0x01]. */
+export const ARRAY_MARKER_MSGPACK: Uint8Array = new Uint8Array(
+  encode(new ExtData(ARRAY_MARKER_EXT_TYPE, new Uint8Array(0)))
+);
+
+/** True if `bytes` is the encoded array marker. Compares bytes; no decode. */
+export function isArrayMarkerBytes(bytes: Uint8Array): boolean {
+  if (bytes.length !== ARRAY_MARKER_MSGPACK.length) return false;
+  for (let i = 0; i < bytes.length; i++) {
+    if (bytes[i] !== ARRAY_MARKER_MSGPACK[i]) return false;
+  }
+  return true;
 }
 
-export function decodeValue(bytes: Uint8Array): JSONValue {
+export function encodeValue(value: StoredValue): Uint8Array {
+  if (value === ARRAY_MARKER) return ARRAY_MARKER_MSGPACK;
+  return encode(value as JSONValue);
+}
+
+export function decodeValue(bytes: Uint8Array): StoredValue {
+  if (isArrayMarkerBytes(bytes)) return ARRAY_MARKER;
+  return decode(bytes) as JSONValue;
+}
+
+/** Decode a value known not to be the array marker. */
+export function decodeJsonValue(bytes: Uint8Array): JSONValue {
   return decode(bytes) as JSONValue;
 }
 
@@ -38,6 +67,7 @@ export function encodeNode(node: LeafNode | InternalNode): Uint8Array {
       l: node.level,
       k: node.keys,
       c: node.children,
+      e: node.childEntryHashes,
     });
   }
 }
@@ -69,6 +99,7 @@ export function decodeNode(bytes: Uint8Array, chunkHash: Uint8Array): TreeNode {
       level: raw.l as number,
       keys: raw.k as string[],
       children: raw.c as Uint8Array[],
+      childEntryHashes: raw.e as Uint8Array[],
     } satisfies InternalNode;
   }
 }
@@ -77,6 +108,7 @@ export function decodeNode(bytes: Uint8Array, chunkHash: Uint8Array): TreeNode {
 
 export function encodeRootPointer(root: RootPointer): JSONBlob {
   return toBlob(JSON.stringify({
+    format: root.format,
     chunkHash: toHex(root.chunkHash),
     entryHash: toHex(root.entryHash),
     chunkSize: root.chunkSize,
@@ -86,7 +118,11 @@ export function encodeRootPointer(root: RootPointer): JSONBlob {
 
 export function decodeRootPointer(blob: JSONBlob): RootPointer {
   const raw = JSON.parse(blob as string);
+  if (raw.format !== FORMAT_VERSION) {
+    throw new UnsupportedFormatError(raw.format, FORMAT_VERSION);
+  }
   return {
+    format: raw.format,
     chunkHash: hexToBytes(raw.chunkHash),
     entryHash: hexToBytes(raw.entryHash),
     chunkSize: raw.chunkSize,

@@ -16,6 +16,25 @@ export type JSONPatchDocument = Brand<string, 'JSONPatchDocument'>;
 export type JSONPointer = Brand<string, 'JSONPointer'>;
 export type ContentHash = Brand<string, 'ContentHash'>;
 
+// ─── Array marker ─────────────────────────────────────────────────────────────
+
+declare const arrayMarkerBrand: unique symbol;
+export interface ArrayMarker {
+  readonly [arrayMarkerBrand]: true;
+}
+
+/**
+ * Sentinel stored at an array's own tree key to record that the container is an
+ * array rather than an object. Serialised as a msgpack extension type, which no
+ * JSON value can produce, so it is unambiguous — and because it lives inside
+ * `valueMsgpack` it contributes to `entryHash`, making container shape part of
+ * the content identity.
+ */
+export const ARRAY_MARKER = Object.freeze({}) as unknown as ArrayMarker;
+
+/** A value as stored in a leaf entry: any JSON value, or the array marker. */
+export type StoredValue = JSONValue | ArrayMarker;
+
 // ─── Internal cast helpers (no validation) ───────────────────────────────────
 
 export const toKey = (s: string): KeyString => s as KeyString;
@@ -30,17 +49,25 @@ export interface StorageAdapter {
   persistBlob(key: KeyString, value: JSONBlob): Promise<void>;
   readBlob(key: KeyString): Promise<JSONBlob>;
   deleteBlob(key: KeyString): Promise<void>;
+  /** Optional batch read, used to skip writing chunks that already exist. */
   readBlobs?(keys: KeyString[]): Promise<Map<KeyString, JSONBlob>>;
+  /**
+   * Optional prefix listing. Required by `gc()`, which has no other way to find
+   * blobs that are no longer referenced. Both IndexedDB (key ranges) and GCS
+   * (prefix queries) support this.
+   */
+  listBlobs?(prefix: string): Promise<KeyString[]>;
 }
 
 // ─── Calibration ─────────────────────────────────────────────────────────────
 
 export interface PartitionerState {
+  /** Measured fixed cost of one read, in milliseconds. */
   overheadLatency: number;
+  /** Measured marginal cost of reading one further KB, in milliseconds. */
   perKbLatency: number;
+  /** Target size of a tree node blob, in bytes — the only tuned parameter. */
   chunkSize: number;
-  prefetchWidth: number;
-  cacheSizeBytes: number;
   calibratedAt: string;
   detectedBackend: 'indexeddb' | 'gcp' | 'unknown';
 }
@@ -52,6 +79,15 @@ export interface PartitionerOptions {
   initialState?: Partial<PartitionerState>;
   calibrationTtlMs?: number;
   writeRetries?: number;
+  /**
+   * Keep chunks that a `put` replaced instead of deleting them immediately.
+   *
+   * Deleting straight away can break a reader that is midway through the old
+   * version of the tree — another tab, or a peer that read the root pointer a
+   * moment ago. Retaining them trades storage for that safety; `gc(key)`
+   * reclaims them once readers have moved on. Defaults to false.
+   */
+  retainStaleChunks?: boolean;
   /**
    * Optional document-level transform applied to the value before it is
    * flattened and stored. `decoder` is the inverse, applied after the
@@ -85,11 +121,27 @@ export interface InternalNode {
   chunkHash: Uint8Array;
   entryHash: Uint8Array;
   level: number;
-  keys: string[];     // separator keys (first key of each child except the first)
-  children: Uint8Array[]; // chunkHash of each child
+  /**
+   * Last key covered by each child, one per child. A child holds every key up to
+   * and including its entry here, which routes lookups; it is also the key the
+   * child's chunk closed on, which the level above groups by.
+   */
+  keys: string[];
+  /** chunkHash of each child. */
+  children: Uint8Array[];
+  /**
+   * entryHash of each child, one per child.
+   *
+   * Carrying these lets `patch` split a node, or drop an emptied one, using only
+   * the node in hand: a new node's entryHash is the XOR of its children's, so no
+   * sibling has to be fetched to recompute it. Without them, re-chunking during
+   * a patch would cost a read per sibling.
+   */
+  childEntryHashes: Uint8Array[];
 }
 
 export interface RootPointer {
+  format: number; // on-disk format version — see FORMAT_VERSION
   chunkHash: Uint8Array; // chunkHash of the root node blob
   entryHash: Uint8Array; // chunk-size-independent fingerprint
   chunkSize: number;
@@ -99,6 +151,16 @@ export interface RootPointer {
 export type TreeNode = LeafNode | InternalNode;
 
 // ─── Constants ────────────────────────────────────────────────────────────────
+
+/**
+ * On-disk format version, written into every root pointer.
+ *
+ * v2 made container shape explicit (see ARRAY_MARKER), fixed array indices to be
+ * dense, and stopped double-escaping pointer segments. v3 added per-child entry
+ * hashes and first keys to internal nodes so `patch` can re-chunk incrementally.
+ * Earlier trees are not readable.
+ */
+export const FORMAT_VERSION = 3;
 
 export const ROOT_PREFIX = '__root__/';
 export const CHUNK_PREFIX = 'chunks/';

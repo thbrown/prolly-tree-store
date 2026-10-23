@@ -31,6 +31,14 @@ export class MemoryStorageAdapter implements StorageAdapter {
     return result;
   }
 
+  async listBlobs(prefix: string): Promise<KeyString[]> {
+    const result: KeyString[] = [];
+    for (const key of this.store.keys()) {
+      if (key.startsWith(prefix)) result.push(key as KeyString);
+    }
+    return result;
+  }
+
   /** Number of blobs currently in the store. Useful in tests. */
   get size(): number {
     return this.store.size;

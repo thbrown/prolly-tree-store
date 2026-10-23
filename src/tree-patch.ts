@@ -8,38 +8,42 @@ import type {
   LeafNode,
   InternalNode,
 } from './types.js';
-import { PatchTestFailedError } from './errors.js';
 import {
   decodeRootPointer,
-  decodeNode,
   encodeNode,
-  blobToNodeBytes,
   nodeBytesToBlob,
   encodeRootPointer,
-  encodeValue,
 } from './serialization.js';
-import { chunkHashOf, entryHashOf, entryHashToContentHash, toHex, hexToBytes } from './hashing.js';
-import { pointerToTreeKey, flattenDocument } from './encoding.js';
-import { toPointer } from './types.js';
-import { get } from './tree-read.js';
+import { entryHashToContentHash, toHex, hexToBytes } from './hashing.js';
+import {
+  groupLeafEntries,
+  groupChildren,
+  makeLeaf,
+  makeInternal,
+  childrenOf,
+} from './prolly.js';
+import type { Child, BuiltNode } from './prolly.js';
 import * as jsonpatch from 'fast-json-patch';
-import { rootKey, chunkKey, fetchNode } from './tree-utils.js';
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-// ─── Key-level mutation types ─────────────────────────────────────────────────
-
-type KeyMutation =
-  | { key: string; op: 'set'; valueMsgpack: Uint8Array }
-  | { key: string; op: 'del' };
+import { rootKey, chunkKey, fetchNode, newNodeCache } from './tree-utils.js';
+import type { NodeCache } from './tree-utils.js';
+import { treeReader } from './prefix-scan.js';
+import { PendingState, applyOps } from './patch-overlay.js';
+import type { KeyMutation } from './patch-overlay.js';
 
 // ─── Routing mutations to children ────────────────────────────────────────────
 
+/**
+ * Index of the child covering `key`.
+ *
+ * `keys[i]` is the last key child `i` holds, so the first child whose last key
+ * is not below `key` owns it. A key past the final child's range belongs to that
+ * child, which is where an append lands.
+ */
 function childIndexForKey(node: InternalNode, key: string): number {
-  for (let i = node.keys.length - 1; i >= 0; i--) {
-    if (key >= node.keys[i]) return i + 1;
+  for (let i = 0; i < node.keys.length; i++) {
+    if (key <= node.keys[i]) return i;
   }
-  return 0;
+  return node.keys.length - 1;
 }
 
 function distributeToChildren(
@@ -55,104 +59,76 @@ function distributeToChildren(
   return map;
 }
 
-// ─── Partial entry collection ─────────────────────────────────────────────────
-
-async function collectEntriesUnderPrefix(
-  nodeHash: Uint8Array,
-  prefix: string,
-  docKey: KeyString,
-  adapter: StorageAdapter
-): Promise<Array<{ key: string; valueMsgpack: Uint8Array }>> {
-  const node = await fetchNode(nodeHash, docKey, adapter);
-
-  if (node.type === 0x02) {
-    const leaf = node as LeafNode;
-    return leaf.entries.filter(
-      e => prefix === '' || e.key === prefix || e.key.startsWith(prefix + '\x00')
-    );
-  }
-
-  const internal = node as InternalNode;
-  const results: Array<{ key: string; valueMsgpack: Uint8Array }> = [];
-
-  for (let i = 0; i < internal.children.length; i++) {
-    const lo = i === 0 ? '' : internal.keys[i - 1];
-    const hi = i < internal.keys.length ? internal.keys[i] : null;
-    const loOk = lo === '' || lo <= prefix || lo.startsWith(prefix) || prefix.startsWith(lo) || prefix >= lo;
-    const hiOk = hi === null || hi > prefix;
-    if (loOk && hiOk) {
-      const sub = await collectEntriesUnderPrefix(internal.children[i], prefix, docKey, adapter);
-      results.push(...sub);
-    }
-  }
-
-  return results;
-}
-
-// ─── Ops → flat key mutations ─────────────────────────────────────────────────
-
-async function opsToMutations(
-  ops: jsonpatch.Operation[],
-  rootHash: Uint8Array,
-  docKey: KeyString,
-  adapter: StorageAdapter
-): Promise<KeyMutation[]> {
-  const byKey = new Map<string, KeyMutation>();
-  const apply = (m: KeyMutation) => byKey.set(m.key, m);
-
-  for (const op of ops) {
-    if (op.op === 'test') continue;
-
-    const prefix = pointerToTreeKey(op.path as JSONPointer);
-
-    if (op.op === 'remove' || op.op === 'replace' || op.op === 'add') {
-      const old = await collectEntriesUnderPrefix(rootHash, prefix, docKey, adapter);
-      for (const e of old) apply({ key: e.key, op: 'del' });
-    }
-
-    if (op.op === 'add' || op.op === 'replace') {
-      const flat = flattenDocument((op as jsonpatch.AddOperation<JSONValue> | jsonpatch.ReplaceOperation<JSONValue>).value);
-      for (const [suffix, value] of flat) {
-        const key =
-          prefix === '' ? suffix
-          : suffix === '' ? prefix
-          : `${prefix}\x00${suffix}`;
-        apply({ key, op: 'set', valueMsgpack: encodeValue(value) });
-      }
-    }
-  }
-
-  return [...byKey.values()].sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
-}
-
 // ─── Core incremental tree update ────────────────────────────────────────────
 
-interface MutationResult {
-  chunkHash: Uint8Array;
-  entryHash: Uint8Array;
+/** What a mutated subtree becomes, in its parent's terms. */
+interface Replacement {
+  /**
+   * The nodes that now stand where the old node stood. Empty when every entry
+   * beneath it was removed, which is how emptied nodes are merged away rather
+   * than left behind; more than one when the node was split.
+   */
+  children: Child[];
+  /** Level of the produced nodes: 0 for leaves, otherwise the internal level. */
+  level: number;
+  /** entryHash of the node being replaced, for the caller's XOR bookkeeping. */
   oldEntryHash: Uint8Array;
 }
 
+/** True if every byte of a 32-byte hash is zero. */
+function isZeroHash(hash: Uint8Array): boolean {
+  for (let i = 0; i < hash.length; i++) if (hash[i] !== 0) return false;
+  return true;
+}
+
 /**
- * Apply `mutations` to the subtree rooted at `nodeHash`.
+ * Nodes written and nodes made unreachable by a mutation walk.
  *
- * New nodes are collected in `newNodes`. Replaced node hashes are collected
- * in `replacedHexes` so the caller can delete the now-orphaned blobs after
- * committing the new root pointer.
+ * `retained` holds the children of visited internal nodes that the walk did not
+ * descend into. Those subtrees are unchanged and still referenced, and their
+ * hashes are known from the parent node that was already fetched — so deciding
+ * what is safe to delete costs no extra reads.
+ */
+interface WalkOutcome {
+  newNodes: Map<string, Uint8Array>;
+  replacedHexes: Set<string>;
+  retainedHexes: Set<string>;
+}
+
+function record(built: BuiltNode, out: WalkOutcome): Child {
+  out.newNodes.set(toHex(built.child.chunkHash), built.bytes);
+  return built.child;
+}
+
+/**
+ * Apply `mutations` to the subtree rooted at `nodeHash`, re-chunking as it goes.
+ *
+ * Mutated nodes are rebuilt and regrouped at the same content-defined boundaries
+ * `put` uses, so a leaf that grew past its boundary splits and a leaf that lost
+ * all its entries disappears. Splitting and dropping are both local: an internal
+ * node records each child's entryHash and first key, so a new node's entryHash
+ * is the XOR of the children it ends up with and no sibling is ever fetched.
+ *
+ * A node is only a deletion candidate if its hash cannot appear elsewhere in the
+ * tree. Within one document every node covers a distinct key range, and a node's
+ * encoded bytes include its keys, so two nodes cannot share a hash — except a
+ * node covering no entries at all, which has no keys to tell it apart. Those are
+ * identified by an all-zero entryHash and are never deleted; the only one that
+ * can exist is the empty root, and `gc()` reclaims any stragglers.
  */
 async function applyMutationBatch(
   nodeHash: Uint8Array,
   mutations: KeyMutation[],
   docKey: KeyString,
   adapter: StorageAdapter,
-  newNodes: Map<string, Uint8Array>,
-  replacedHexes: Set<string>
-): Promise<MutationResult> {
-  const node = await fetchNode(nodeHash, docKey, adapter);
+  out: WalkOutcome,
+  cache: NodeCache,
+  chunkSize: number
+): Promise<Replacement> {
+  const node = await fetchNode(nodeHash, docKey, adapter, cache);
   const oldEntryHash = new Uint8Array(node.entryHash);
 
-  // Track that this node is being replaced
-  replacedHexes.add(toHex(nodeHash));
+  if (!isZeroHash(oldEntryHash)) out.replacedHexes.add(toHex(nodeHash));
 
   // ── Leaf ──────────────────────────────────────────────────────────────────
   if (node.type === 0x02) {
@@ -164,103 +140,85 @@ async function applyMutationBatch(
       else entries.set(m.key, m.valueMsgpack);
     }
 
-    const sortedEntries = [...entries.entries()]
-      .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
+    if (entries.size === 0) return { children: [], level: 0, oldEntryHash };
+
+    const sorted = [...entries.entries()]
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
       .map(([key, valueMsgpack]) => ({ key, valueMsgpack }));
 
-    const entryHash = entryHashOf(sortedEntries);
-    const newLeaf = {
-      type: 0x02 as const,
-      chunkHash: new Uint8Array(32),
-      entryHash,
-      entries: sortedEntries,
-    };
-    const bytes = encodeNode(newLeaf);
-    const chunkHashHex = chunkHashOf(bytes) as string;
-    const chunkHash = hexToBytes(chunkHashHex);
+    const children = groupLeafEntries(sorted, chunkSize).map(group =>
+      record(makeLeaf(group), out)
+    );
 
-    newNodes.set(chunkHashHex, bytes);
-    return { chunkHash, entryHash, oldEntryHash };
+    return { children, level: 0, oldEntryHash };
   }
 
   // ── Internal node ─────────────────────────────────────────────────────────
   const internal = node as InternalNode;
   const childMutMap = distributeToChildren(internal, mutations);
+  const oldChildren = childrenOf(internal);
 
-  const childResults = await Promise.all(
+  // Siblings the walk will not descend into keep their subtrees intact.
+  for (let i = 0; i < oldChildren.length; i++) {
+    if (!childMutMap.has(i)) out.retainedHexes.add(toHex(oldChildren[i].chunkHash));
+  }
+
+  const results = new Map<number, Replacement>();
+  await Promise.all(
     [...childMutMap.entries()].map(async ([childIdx, childMuts]) => {
-      const result = await applyMutationBatch(
-        internal.children[childIdx], childMuts, docKey, adapter, newNodes, replacedHexes
+      results.set(
+        childIdx,
+        await applyMutationBatch(
+          oldChildren[childIdx].chunkHash, childMuts, docKey, adapter, out, cache, chunkSize
+        )
       );
-      return { childIdx, result };
     })
   );
 
-  const newChildren = [...internal.children];
-  const newEntryHash = new Uint8Array(internal.entryHash);
-
-  for (const { childIdx, result } of childResults) {
-    newChildren[childIdx] = result.chunkHash;
-    for (let j = 0; j < 32; j++) {
-      newEntryHash[j] ^= result.oldEntryHash[j] ^ result.entryHash[j];
-    }
+  // Splice each mutated child's replacement into the child list in place.
+  const newChildren: Child[] = [];
+  for (let i = 0; i < oldChildren.length; i++) {
+    const replaced = results.get(i);
+    if (replaced) newChildren.push(...replaced.children);
+    else newChildren.push(oldChildren[i]);
   }
 
-  const newInternal: InternalNode = {
-    type: 0x01,
-    chunkHash: new Uint8Array(32),
-    entryHash: newEntryHash,
-    level: internal.level,
-    keys: internal.keys,
-    children: newChildren,
-  };
-  const bytes = encodeNode(newInternal);
-  const chunkHashHex = chunkHashOf(bytes) as string;
-  newInternal.chunkHash = hexToBytes(chunkHashHex);
+  if (newChildren.length === 0) {
+    return { children: [], level: internal.level, oldEntryHash };
+  }
 
-  newNodes.set(chunkHashHex, bytes);
-  return { chunkHash: newInternal.chunkHash, entryHash: newEntryHash, oldEntryHash };
+  // Regroup at this level so a node that gained children splits rather than
+  // growing without bound.
+  const children = groupChildren(newChildren, internal.level, chunkSize).map(group =>
+    record(makeInternal(group, internal.level), out)
+  );
+
+  return { children, level: internal.level, oldEntryHash };
 }
 
-// ─── New-tree reachability walk ───────────────────────────────────────────────
-
 /**
- * Walk the new tree (root at `nodeHash`) and collect every reachable chunk hex.
- * Uses `newNodes` for newly-created nodes (in memory) and the adapter for
- * unchanged nodes, avoiding double-reads where possible.
- *
- * This is needed because `replacedHexes` may contain a hash that was visited
- * during mutation traversal but also appears as an UNCHANGED child elsewhere in
- * the new tree (e.g. two children with identical content sharing the same hash).
- * Simply checking `newNodes` misses those retained references.
+ * Reduce a replaced root to a single node, adding levels when it split and
+ * falling back to an empty leaf when the document lost every entry.
  */
-async function collectNewTreeHexes(
-  nodeHash: Uint8Array,
-  docKey: KeyString,
-  adapter: StorageAdapter,
-  newNodes: Map<string, Uint8Array>,
-  out: Set<string>
-): Promise<void> {
-  const hex = toHex(nodeHash);
-  if (out.has(hex)) return;
-  out.add(hex);
+function buildNewRoot(
+  replacement: Replacement,
+  chunkSize: number,
+  out: WalkOutcome
+): Child {
+  if (replacement.children.length === 0) return record(makeLeaf([]), out);
 
-  let bytes: Uint8Array;
-  if (newNodes.has(hex)) {
-    bytes = newNodes.get(hex)!;
-  } else {
-    const blob = await adapter.readBlob(chunkKey(docKey, nodeHash));
-    bytes = blobToNodeBytes(blob);
-  }
+  let children = replacement.children;
+  let level = replacement.level + 1;
 
-  const node = decodeNode(bytes, nodeHash);
-  if (node.type === 0x01) {
-    await Promise.all(
-      (node as InternalNode).children.map(ch =>
-        collectNewTreeHexes(ch, docKey, adapter, newNodes, out)
-      )
+  while (children.length > 1) {
+    children = groupChildren(children, level, chunkSize).map(group =>
+      record(makeInternal(group, level), out)
     );
+    level++;
   }
+
+
+  return children[0];
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────
@@ -268,8 +226,11 @@ async function collectNewTreeHexes(
 /**
  * Apply an RFC 6902 patch to a stored document without loading the full document.
  *
- * `test` ops are evaluated via partial reads before any mutation. If any test
- * fails the document is left unchanged and PatchTestFailedError is thrown.
+ * Operations are planned in order against an overlay of pending entry changes
+ * (see ./patch-overlay.ts), so each op sees the result of the ones before it, as
+ * RFC 6902 requires. Nothing is written until the whole list has been planned:
+ * if any op is rejected — a failing `test`, an out-of-range array index, an
+ * unsupported op — the stored document is left untouched.
  *
  * Replaced nodes are deleted after the new root pointer is committed, keeping
  * storage bounded with no separate GC sweep required.
@@ -278,63 +239,62 @@ export async function patch(
   key: KeyString,
   patches: JSONPatchDocument,
   adapter: StorageAdapter,
+  retainStaleChunks = false
 ): Promise<ContentHash> {
   const ops: jsonpatch.Operation[] = JSON.parse(patches as string);
-  if (ops.length === 0) {
-    const blob = await adapter.readBlob(rootKey(key));
-    const rootPtr = decodeRootPointer(blob);
-    return entryHashToContentHash(rootPtr.entryHash);
-  }
-
-  // Validate all test ops atomically via partial reads — no full-doc load
-  for (const op of ops) {
-    if (op.op !== 'test') continue;
-    const actual = await get(key, adapter, op.path as JSONPointer);
-    const expected = (op as jsonpatch.TestOperation<JSONValue>).value;
-    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
-      throw new PatchTestFailedError(toPointer(op.path), expected as JSONValue, actual);
-    }
-  }
 
   const rootBlob = await adapter.readBlob(rootKey(key));
   const rootPtr = decodeRootPointer(rootBlob);
 
-  const mutations = await opsToMutations(ops, rootPtr.chunkHash, key, adapter);
+  if (ops.length === 0) return entryHashToContentHash(rootPtr.entryHash);
+
+  const cache = newNodeCache();
+  const state = new PendingState(treeReader(rootPtr.chunkHash, key, adapter, cache));
+  await applyOps(ops, state);
+
+  const mutations: KeyMutation[] = state.toMutations();
   if (mutations.length === 0) return entryHashToContentHash(rootPtr.entryHash);
 
-  const newNodes = new Map<string, Uint8Array>();
-  const replacedHexes = new Set<string>();
-  const result = await applyMutationBatch(
-    rootPtr.chunkHash, mutations, key, adapter, newNodes, replacedHexes
+  const out: WalkOutcome = {
+    newNodes: new Map(),
+    replacedHexes: new Set(),
+    retainedHexes: new Set(),
+  };
+  const replacement = await applyMutationBatch(
+    rootPtr.chunkHash, mutations, key, adapter, out, cache, rootPtr.chunkSize
   );
+  const result = buildNewRoot(replacement, rootPtr.chunkSize, out);
 
   // Write new nodes
   await Promise.all(
-    [...newNodes.entries()].map(([hex, bytes]) =>
+    [...out.newNodes.entries()].map(([hex, bytes]) =>
       adapter.persistBlob(chunkKey(key, hexToBytes(hex)), nodeBytesToBlob(bytes))
     )
   );
 
   // Commit new root pointer
   await adapter.persistBlob(rootKey(key), encodeRootPointer({
+    format: rootPtr.format,
     chunkHash: result.chunkHash,
     entryHash: result.entryHash,
     chunkSize: rootPtr.chunkSize,
     calibratedAt: rootPtr.calibratedAt,
   }));
 
-  // Collect ALL hashes reachable from the new root before deleting anything.
-  // This prevents deleting a hash that appears multiple times in the old tree
-  // (e.g. two children with identical content): the visited copy is in
-  // replacedHexes, but the untouched copy is still referenced by the new tree.
-  const allNewTreeHexes = new Set<string>();
-  await collectNewTreeHexes(result.chunkHash, key, adapter, newNodes, allNewTreeHexes);
-
-  await Promise.all(
-    [...replacedHexes]
-      .filter(hex => !allNewTreeHexes.has(hex))
-      .map(hex => adapter.deleteBlob(chunkKey(key, hexToBytes(hex))))
-  );
+  // Delete the nodes the walk replaced, except any that the new tree still
+  // points at: a node rewritten to identical bytes, or a retained sibling.
+  // Both sets came from nodes already in hand, so this needs no further reads.
+  //
+  // `retainStaleChunks` defers this to `gc(key)`, for the same reasons it does
+  // on `put`: a concurrent reader holding the previous root hash, or another
+  // document sharing these chunks, still needs them.
+  if (!retainStaleChunks) {
+    await Promise.all(
+      [...out.replacedHexes]
+        .filter(hex => !out.newNodes.has(hex) && !out.retainedHexes.has(hex))
+        .map(hex => adapter.deleteBlob(chunkKey(key, hexToBytes(hex))))
+    );
+  }
 
   return entryHashToContentHash(result.entryHash);
 }

@@ -4,6 +4,12 @@ import { BlobNotFoundError } from './errors.js';
 
 const PROBE_SIZES = [4096, 65536, 524288]; // 4 KB, 64 KB, 512 KB
 const PROBE_READS = 3;
+/**
+ * A read taken straight after the matching write hits whatever cache sits in
+ * front of the backend, which understates the fixed cost. The first round is
+ * discarded for that reason.
+ */
+const PROBE_WARMUP_ROUNDS = 1;
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
@@ -31,20 +37,25 @@ function makeProbeBlob(size: number): string {
  * Always re-measures even if a valid state exists.
  */
 export async function calibrate(adapter: StorageAdapter): Promise<PartitionerState> {
-  const probeKeys = PROBE_SIZES.map((size, i) => toKey(`__calibration__/probe_${size}_${i}`));
+  // A nonce keeps concurrent clients from probing each other's blobs.
+  const nonce = Math.random().toString(36).slice(2, 10);
+  const probeKeys = PROBE_SIZES.map((size, i) =>
+    toKey(`__calibration__/probe_${nonce}_${size}_${i}`)
+  );
 
   // Write probes
   for (let i = 0; i < PROBE_SIZES.length; i++) {
     await adapter.persistBlob(probeKeys[i], toBlob(makeProbeBlob(PROBE_SIZES[i])));
   }
 
-  // Measure read times
+  // Measure read times, discarding the warm-up round
   const times: number[][] = PROBE_SIZES.map(() => []);
-  for (let r = 0; r < PROBE_READS; r++) {
+  for (let r = 0; r < PROBE_READS + PROBE_WARMUP_ROUNDS; r++) {
     for (let i = 0; i < PROBE_SIZES.length; i++) {
       const start = performance.now();
       await adapter.readBlob(probeKeys[i]);
-      times[i].push(performance.now() - start);
+      const elapsed = performance.now() - start;
+      if (r >= PROBE_WARMUP_ROUNDS) times[i].push(elapsed);
     }
   }
 
@@ -65,9 +76,6 @@ export async function calibrate(adapter: StorageAdapter): Promise<PartitionerSta
   // IndexedDB theoretical optimal is huge; cap at 64 KB for local adapters
   const cappedChunkSize = overheadLatency < 10 ? Math.min(chunkSize, 65536) : chunkSize;
 
-  const prefetchWidth = clamp(Math.ceil(overheadLatency / 15), 2, 32);
-  const cacheSizeBytes = overheadLatency > 20 ? 20_971_520 : 4_194_304;
-
   const detectedBackend =
     overheadLatency < 10 ? 'indexeddb'
     : overheadLatency > 50 ? 'gcp'
@@ -77,8 +85,6 @@ export async function calibrate(adapter: StorageAdapter): Promise<PartitionerSta
     overheadLatency,
     perKbLatency,
     chunkSize: cappedChunkSize,
-    prefetchWidth,
-    cacheSizeBytes,
     calibratedAt: new Date().toISOString(),
     detectedBackend,
   };
