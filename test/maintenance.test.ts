@@ -193,6 +193,42 @@ describe('gc', () => {
     expect(chunkKeys(adapter, 'd').length).toBeLessThanOrEqual(first + 2);
   });
 
+  test('retainStaleChunks defers deletion on patch, not just put', async () => {
+    const { adapter, store } = makeStore({ retainStaleChunks: true });
+    const doc: Record<string, JSONValue> = {};
+    for (let i = 0; i < 80; i++) doc[`k${i}`] = i;
+
+    await store.put(K('d'), doc);
+    const before = new Set(chunkKeys(adapter, 'd'));
+
+    await store.patch(K('d'), patchOps([{ op: 'replace', path: '/k0', value: 'changed' }]));
+
+    // Every chunk the previous version used is still there, so a reader that
+    // is midway through it — another tab, or a document sharing these chunks —
+    // does not hit a dangling pointer.
+    const after = new Set(chunkKeys(adapter, 'd'));
+    for (const key of before) expect(after.has(key)).toBe(true);
+    expect(after.size).toBeGreaterThan(before.size);
+
+    await store.gc(K('d'));
+    expect(await store.get(K('d'))).toEqual({ ...doc, k0: 'changed' });
+    expect(chunkKeys(adapter, 'd').length).toBeLessThanOrEqual(before.size + 2);
+  });
+
+  test('patch still deletes replaced chunks by default', async () => {
+    const { adapter, store } = makeStore();
+    const doc: Record<string, JSONValue> = {};
+    for (let i = 0; i < 80; i++) doc[`k${i}`] = i;
+
+    await store.put(K('d'), doc);
+    const before = chunkKeys(adapter, 'd').length;
+
+    await store.patch(K('d'), patchOps([{ op: 'replace', path: '/k0', value: 'changed' }]));
+
+    expect(chunkKeys(adapter, 'd').length).toBeLessThanOrEqual(before + 1);
+    expect(await store.gc(K('d'))).toBe(0);
+  });
+
   test('after delete, gc clears everything under the document prefix', async () => {
     const { adapter, store } = makeStore();
     await store.put(K('d'), { a: 1, b: [1, 2, 3] });

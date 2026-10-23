@@ -239,6 +239,7 @@ export async function patch(
   key: KeyString,
   patches: JSONPatchDocument,
   adapter: StorageAdapter,
+  retainStaleChunks = false
 ): Promise<ContentHash> {
   const ops: jsonpatch.Operation[] = JSON.parse(patches as string);
 
@@ -283,11 +284,17 @@ export async function patch(
   // Delete the nodes the walk replaced, except any that the new tree still
   // points at: a node rewritten to identical bytes, or a retained sibling.
   // Both sets came from nodes already in hand, so this needs no further reads.
-  await Promise.all(
-    [...out.replacedHexes]
-      .filter(hex => !out.newNodes.has(hex) && !out.retainedHexes.has(hex))
-      .map(hex => adapter.deleteBlob(chunkKey(key, hexToBytes(hex))))
-  );
+  //
+  // `retainStaleChunks` defers this to `gc(key)`, for the same reasons it does
+  // on `put`: a concurrent reader holding the previous root hash, or another
+  // document sharing these chunks, still needs them.
+  if (!retainStaleChunks) {
+    await Promise.all(
+      [...out.replacedHexes]
+        .filter(hex => !out.newNodes.has(hex) && !out.retainedHexes.has(hex))
+        .map(hex => adapter.deleteBlob(chunkKey(key, hexToBytes(hex))))
+    );
+  }
 
   return entryHashToContentHash(result.entryHash);
 }

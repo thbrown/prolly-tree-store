@@ -109,7 +109,7 @@ export class ProllyTreeStore {
 
   async patch(key: KeyString, patches: JSONPatchDocument): Promise<ContentHash> {
     await this.ensureState();
-    return treePatch(key, patches, this.adapter);
+    return treePatch(key, patches, this.adapter, this.retainStaleChunks);
   }
 
   // ── Diffing ────────────────────────────────────────────────────────────────
